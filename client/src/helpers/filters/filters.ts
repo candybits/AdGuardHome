@@ -28,11 +28,11 @@ export default {
             "homepage": "https://badmojr.github.io/1Hosts/",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt"
         },
-        "1hosts_mini": {
-            "name": "1Hosts (mini)",
+        "1hosts_xtra": {
+            "name": "1Hosts (Xtra)",
             "categoryId": "general",
             "homepage": "https://badmojr.github.io/1Hosts/",
-            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_38.txt"
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_70.txt"
         },
         "CHN_adrules": {
             "name": "CHN: AdRules DNS List",
@@ -196,11 +196,23 @@ export default {
             "homepage": "https://github.com/hagezi/dns-blocklists#piracy",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_46.txt"
         },
+        "hagezi_apple_tracker_blocklist": {
+            "name": "HaGeZi's Apple Tracker Blocklist",
+            "categoryId": "other",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_67.txt"
+        },
         "hagezi_badware_hoster_blocklist": {
             "name": "HaGeZi's Badware Hoster Blocklist",
             "categoryId": "security",
             "homepage": "https://github.com/hagezi/dns-blocklists",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_55.txt"
+        },
+        "hagezi_dns_rebind_protection": {
+            "name": "HaGeZi's DNS Rebind Protection",
+            "categoryId": "security",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_71.txt"
         },
         "hagezi_dyndns_blocklist": {
             "name": "HaGeZi's DynDNS Blocklist",
@@ -226,6 +238,12 @@ export default {
             "homepage": "https://github.com/hagezi/dns-blocklists",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_34.txt"
         },
+        "hagezi_oppo_realme_tracker_blocklist": {
+            "name": "HaGeZi's OPPO \u0026 Realme Tracker Blocklist",
+            "categoryId": "other",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_66.txt"
+        },
         "hagezi_pro": {
             "name": "HaGeZi's Pro Blocklist",
             "categoryId": "general",
@@ -237,6 +255,12 @@ export default {
             "categoryId": "general",
             "homepage": "https://github.com/hagezi/dns-blocklists",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_51.txt"
+        },
+        "hagezi_samsung_tracker_blocklist": {
+            "name": "HaGeZi's Samsung Tracker Blocklist",
+            "categoryId": "other",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_61.txt"
         },
         "hagezi_the_worlds_most_abused_tlds": {
             "name": "HaGeZi's The World's Most Abused TLDs",
@@ -255,6 +279,24 @@ export default {
             "categoryId": "general",
             "homepage": "https://github.com/hagezi/dns-blocklists",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_49.txt"
+        },
+        "hagezi_url_shortener_blocklist": {
+            "name": "HaGeZi's URL Shortener Blocklist",
+            "categoryId": "security",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_68.txt"
+        },
+        "hagezi_vivo_tracker_blocklist": {
+            "name": "HaGeZi's Vivo Tracker Blocklist",
+            "categoryId": "other",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_65.txt"
+        },
+        "hagezi_windows_office_tracker_blocklist": {
+            "name": "HaGeZi's Windows/Office Tracker Blocklist",
+            "categoryId": "other",
+            "homepage": "https://github.com/hagezi/dns-blocklists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_63.txt"
         },
         "hagezi_xiaomi_tracking_blocklist": {
             "name": "HaGeZi's Xiaomi Tracker Blocklist",
@@ -310,6 +352,12 @@ export default {
             "homepage": "https://github.com/durablenapkin/scamblocklist",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_10.txt"
         },
+        "shadowwhisperer_tracking_list": {
+            "name": "ShadowWhisperer Tracking List",
+            "categoryId": "general",
+            "homepage": "https://github.com/ShadowWhisperer/BlockLists",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_69.txt"
+        },
         "shadowwhisperers_dating_list": {
             "name": "ShadowWhisperer's Dating List",
             "categoryId": "other",
@@ -346,17 +394,17 @@ export default {
             "homepage": "https://github.com/uBlockOrigin/uAssets",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_50.txt"
         },
+        "ukrainian_security_filter": {
+            "name": "Ukrainian Security Filter",
+            "categoryId": "other",
+            "homepage": "https://github.com/braveinnovators/ukrainian-security-filter",
+            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_62.txt"
+        },
         "urlhaus_filter_online": {
             "name": "Malicious URL Blocklist (URLHaus)",
             "categoryId": "security",
             "homepage": "https://urlhaus.abuse.ch/",
             "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt"
-        },
-        "windowsspyblocker_hosts_spy_rules": {
-            "name": "WindowsSpyBlocker - Hosts spy rules",
-            "categoryId": "other",
-            "homepage": "https://github.com/crazy-max/WindowsSpyBlocker",
-            "source": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_23.txt"
         }
     }
 }

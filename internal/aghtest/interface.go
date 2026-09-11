@@ -2,50 +2,58 @@ package aghtest
 
 import (
 	"context"
-	"net"
+	"crypto/tls"
+	"crypto/x509"
+	"net/http"
 	"net/netip"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
-	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghtls"
+	nextagh "github.com/AdguardTeam/AdGuardHome/internal/next/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/rdns"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
-	"github.com/AdguardTeam/dnsproxy/proxy"
-	"github.com/AdguardTeam/dnsproxy/upstream"
-	"github.com/miekg/dns"
+	"github.com/AdguardTeam/golibs/testutil"
 )
-
-// Interface Mocks
-//
-// Keep entities in this file in alphabetic order.
-
-// Module adguard-home
-
-// Package aghos
 
 // FSWatcher is a fake [aghos.FSWatcher] implementation for tests.
 type FSWatcher struct {
-	OnStart  func() (err error)
-	OnClose  func() (err error)
-	OnEvents func() (e <-chan struct{})
-	OnAdd    func(name string) (err error)
+	OnStart    func(ctx context.Context) (err error)
+	OnShutdown func(ctx context.Context) (err error)
+	OnEvents   func() (e <-chan aghos.Event)
+	OnAdd      func(name string) (err error)
+	OnRemove   func(name string) (err error)
+}
+
+// NewFSWatcher returns a new *FSWatcher all methods of which panic.
+func NewFSWatcher() (w *FSWatcher) {
+	return &FSWatcher{
+		OnStart:    func(ctx context.Context) (_ error) { panic(testutil.UnexpectedCall(ctx)) },
+		OnShutdown: func(ctx context.Context) (_ error) { panic(testutil.UnexpectedCall(ctx)) },
+		OnEvents:   func() (_ <-chan aghos.Event) { panic(testutil.UnexpectedCall()) },
+		OnAdd:      func(name string) (_ error) { panic(testutil.UnexpectedCall(name)) },
+		OnRemove:   func(name string) (_ error) { panic(testutil.UnexpectedCall(name)) },
+	}
 }
 
 // type check
 var _ aghos.FSWatcher = (*FSWatcher)(nil)
 
 // Start implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Start() (err error) {
-	return w.OnStart()
+func (w *FSWatcher) Start(ctx context.Context) (err error) {
+	return w.OnStart(ctx)
 }
 
-// Close implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Close() (err error) {
-	return w.OnClose()
+// Shutdown implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Shutdown(ctx context.Context) (err error) {
+	return w.OnShutdown(ctx)
 }
 
 // Events implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Events() (e <-chan struct{}) {
+func (w *FSWatcher) Events() (e <-chan aghos.Event) {
 	return w.OnEvents()
 }
 
@@ -54,49 +62,51 @@ func (w *FSWatcher) Add(name string) (err error) {
 	return w.OnAdd(name)
 }
 
-// Package agh
+// Remove implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Remove(name string) (err error) {
+	return w.OnRemove(name)
+}
 
-// ServiceWithConfig is a fake [agh.ServiceWithConfig] implementation for tests.
+// ServiceWithConfig is a fake [nextagh.ServiceWithConfig] implementation for
+// tests.
 type ServiceWithConfig[ConfigType any] struct {
-	OnStart    func() (err error)
+	OnStart    func(ctx context.Context) (err error)
 	OnShutdown func(ctx context.Context) (err error)
 	OnConfig   func() (c ConfigType)
 }
 
 // type check
-var _ agh.ServiceWithConfig[struct{}] = (*ServiceWithConfig[struct{}])(nil)
+var _ nextagh.ServiceWithConfig[struct{}] = (*ServiceWithConfig[struct{}])(nil)
 
-// Start implements the [agh.ServiceWithConfig] interface for
+// Start implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
-func (s *ServiceWithConfig[_]) Start() (err error) {
-	return s.OnStart()
+func (s *ServiceWithConfig[_]) Start(ctx context.Context) (err error) {
+	return s.OnStart(ctx)
 }
 
-// Shutdown implements the [agh.ServiceWithConfig] interface for
+// Shutdown implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
 func (s *ServiceWithConfig[_]) Shutdown(ctx context.Context) (err error) {
 	return s.OnShutdown(ctx)
 }
 
-// Config implements the [agh.ServiceWithConfig] interface for
+// Config implements the [nextagh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
 func (s *ServiceWithConfig[ConfigType]) Config() (c ConfigType) {
 	return s.OnConfig()
 }
 
-// Package client
-
 // AddressProcessor is a fake [client.AddressProcessor] implementation for
 // tests.
 type AddressProcessor struct {
-	OnProcess func(ip netip.Addr)
+	OnProcess func(ctx context.Context, ip netip.Addr)
 	OnClose   func() (err error)
 }
 
 // Process implements the [client.AddressProcessor] interface for
 // *AddressProcessor.
-func (p *AddressProcessor) Process(ip netip.Addr) {
-	p.OnProcess(ip)
+func (p *AddressProcessor) Process(ctx context.Context, ip netip.Addr) {
+	p.OnProcess(ctx, ip)
 }
 
 // Close implements the [client.AddressProcessor] interface for
@@ -107,90 +117,139 @@ func (p *AddressProcessor) Close() (err error) {
 
 // AddressUpdater is a fake [client.AddressUpdater] implementation for tests.
 type AddressUpdater struct {
-	OnUpdateAddress func(ip netip.Addr, host string, info *whois.Info)
+	OnUpdateAddress func(ctx context.Context, ip netip.Addr, host string, info *whois.Info)
 }
 
 // UpdateAddress implements the [client.AddressUpdater] interface for
 // *AddressUpdater.
-func (p *AddressUpdater) UpdateAddress(ip netip.Addr, host string, info *whois.Info) {
-	p.OnUpdateAddress(ip, host, info)
+func (p *AddressUpdater) UpdateAddress(
+	ctx context.Context,
+	ip netip.Addr,
+	host string,
+	info *whois.Info,
+) {
+	p.OnUpdateAddress(ctx, ip, host, info)
 }
-
-// Package dnsforward
-
-// ClientsContainer is a fake [dnsforward.ClientsContainer] implementation for
-// tests.
-type ClientsContainer struct {
-	OnUpstreamConfigByID func(
-		id string,
-		boot upstream.Resolver,
-	) (conf *proxy.CustomUpstreamConfig, err error)
-}
-
-// UpstreamConfigByID implements the [dnsforward.ClientsContainer] interface
-// for *ClientsContainer.
-func (c *ClientsContainer) UpstreamConfigByID(
-	id string,
-	boot upstream.Resolver,
-) (conf *proxy.CustomUpstreamConfig, err error) {
-	return c.OnUpstreamConfigByID(id, boot)
-}
-
-// Package filtering
-
-// Resolver is a fake [filtering.Resolver] implementation for tests.
-type Resolver struct {
-	OnLookupIP func(ctx context.Context, network, host string) (ips []net.IP, err error)
-}
-
-// LookupIP implements the [filtering.Resolver] interface for *Resolver.
-func (r *Resolver) LookupIP(ctx context.Context, network, host string) (ips []net.IP, err error) {
-	return r.OnLookupIP(ctx, network, host)
-}
-
-// Package rdns
 
 // Exchanger is a fake [rdns.Exchanger] implementation for tests.
 type Exchanger struct {
-	OnExchange func(ip netip.Addr) (host string, ttl time.Duration, err error)
+	OnExchange func(ctx context.Context, ip netip.Addr) (host string, ttl time.Duration, err error)
 }
 
 // type check
 var _ rdns.Exchanger = (*Exchanger)(nil)
 
 // Exchange implements [rdns.Exchanger] interface for *Exchanger.
-func (e *Exchanger) Exchange(ip netip.Addr) (host string, ttl time.Duration, err error) {
-	return e.OnExchange(ip)
+func (e *Exchanger) Exchange(
+	ctx context.Context,
+	ip netip.Addr,
+) (host string, ttl time.Duration, err error) {
+	return e.OnExchange(ctx, ip)
 }
 
-// Module dnsproxy
-
-// Package upstream
-
-// UpstreamMock is a fake [upstream.Upstream] implementation for tests.
-//
-// TODO(a.garipov): Replace with all uses of Upstream with UpstreamMock and
-// rename it to just Upstream.
-type UpstreamMock struct {
-	OnAddress  func() (addr string)
-	OnExchange func(req *dns.Msg) (resp *dns.Msg, err error)
-	OnClose    func() (err error)
+// ConfigModifier is a fake [agh.ConfigModifier] implementation for tests.
+type ConfigModifier struct {
+	OnApply func(ctx context.Context)
 }
 
 // type check
-var _ upstream.Upstream = (*UpstreamMock)(nil)
+var _ agh.ConfigModifier = (*ConfigModifier)(nil)
 
-// Address implements the [upstream.Upstream] interface for *UpstreamMock.
-func (u *UpstreamMock) Address() (addr string) {
-	return u.OnAddress()
+// Apply implements the [agh.ConfigModifier] interface for *ConfigModifier.
+func (m *ConfigModifier) Apply(ctx context.Context) {
+	m.OnApply(ctx)
 }
 
-// Exchange implements the [upstream.Upstream] interface for *UpstreamMock.
-func (u *UpstreamMock) Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
-	return u.OnExchange(req)
+// Registrar is a fake [aghhttp.Registrar] implementation for tests.
+type Registrar struct {
+	OnRegister func(method, path string, h http.HandlerFunc)
 }
 
-// Close implements the [upstream.Upstream] interface for *UpstreamMock.
-func (u *UpstreamMock) Close() (err error) {
-	return u.OnClose()
+// type check
+var _ aghhttp.Registrar = (*Registrar)(nil)
+
+// Register implements the [aghhttp.Registrar] interface for *Registrar.
+func (m *Registrar) Register(method, path string, h http.HandlerFunc) {
+	m.OnRegister(method, path, h)
+}
+
+// Manager is a fake [aghtls.Manager] implementation for tests.
+type Manager struct {
+	OnStart                func(ctx context.Context) (err error)
+	OnShutdown             func(ctx context.Context) (err error)
+	OnRefresh              func(ctx context.Context) (err error)
+	OnSet                  func(ctx context.Context, certKey aghtls.TLSPair) (err error)
+	OnUpdates              func(ctx context.Context) (updates <-chan aghtls.UpdateSignal)
+	OnTLSConfig            func() (conf *tls.Config)
+	OnRootCAs              func() (cert *x509.CertPool)
+	OnHasIPAddrs           func() (ok bool)
+	OnExtendedTLSConfig    func() (conf *aghtls.ExtendedTLSConfig)
+	OnSetExtendedTLSConfig func(
+		ctx context.Context,
+		servePlainDNS aghalg.NullBool,
+		conf *aghtls.ExtendedTLSConfig,
+	) (restartHTTPS bool, err error)
+	OnCipherSuites func() (cs []uint16)
+}
+
+// type check
+var _ aghtls.Manager = (*Manager)(nil)
+
+// CipherSuites implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) CipherSuites() (cs []uint16) {
+	return m.OnCipherSuites()
+}
+
+// Set implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) Set(ctx context.Context, certKey aghtls.TLSPair) (err error) {
+	return m.OnSet(ctx, certKey)
+}
+
+// Start implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) Start(ctx context.Context) (err error) {
+	return m.OnStart(ctx)
+}
+
+// Shutdown implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) Shutdown(ctx context.Context) (err error) {
+	return m.OnShutdown(ctx)
+}
+
+// Refresh implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) Refresh(ctx context.Context) (err error) {
+	return m.OnRefresh(ctx)
+}
+
+// Updates implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) Updates(ctx context.Context) (updates <-chan aghtls.UpdateSignal) {
+	return m.OnUpdates(ctx)
+}
+
+// TLSConfig implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) TLSConfig() (conf *tls.Config) {
+	return m.OnTLSConfig()
+}
+
+// RootCAs implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) RootCAs() (pool *x509.CertPool) {
+	return m.OnRootCAs()
+}
+
+// HasIPAddrs implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) HasIPAddrs() (ok bool) {
+	return m.OnHasIPAddrs()
+}
+
+// ExtendedTLSConfig implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) ExtendedTLSConfig() (conf *aghtls.ExtendedTLSConfig) {
+	return m.OnExtendedTLSConfig()
+}
+
+// SetExtendedTLSConfig implements the [aghtls.Manager] interface for *Manager.
+func (m *Manager) SetExtendedTLSConfig(
+	ctx context.Context,
+	servePlainDNS aghalg.NullBool,
+	conf *aghtls.ExtendedTLSConfig,
+) (restartHTTPS bool, err error) {
+	return m.OnSetExtendedTLSConfig(ctx, servePlainDNS, conf)
 }

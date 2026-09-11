@@ -4,24 +4,25 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/httphdr"
-	"github.com/AdguardTeam/golibs/mapsutil"
 )
 
-// upload base translation.
+// upload uploads the base locale file.
 func (c *twoskyClient) upload() (err error) {
 	defer func() { err = errors.Annotate(err, "upload: %w") }()
 
 	uploadURI := c.uri.JoinPath("upload")
-	basePath := filepath.Join(localesDir, defaultBaseFile)
+	basePath := filepath.Join(c.localesDir, defaultBaseFile)
 
 	formData := map[string]string{
 		"format":   "json",
@@ -52,19 +53,18 @@ func prepareMultipartMsg(
 	w := multipart.NewWriter(buf)
 	var fw io.Writer
 
-	err = mapsutil.SortedRangeError(formData, w.WriteField)
-	if err != nil {
-		return nil, "", fmt.Errorf("writing field: %w", err)
+	for _, k := range slices.Sorted(maps.Keys(formData)) {
+		err = w.WriteField(k, formData[k])
+		if err != nil {
+			return nil, "", fmt.Errorf("writing field %q: %w", k, err)
+		}
 	}
 
 	file, err := os.Open(basePath)
 	if err != nil {
 		return nil, "", fmt.Errorf("opening file: %w", err)
 	}
-
-	defer func() {
-		err = errors.WithDeferred(err, file.Close())
-	}()
+	defer func() { err = errors.WithDeferred(err, file.Close()) }()
 
 	h := make(textproto.MIMEHeader)
 	h.Set(httphdr.ContentType, aghhttp.HdrValApplicationJSON)

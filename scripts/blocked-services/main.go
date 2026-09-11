@@ -16,6 +16,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
 
@@ -30,14 +31,13 @@ func main() {
 
 	// Validate the URL.
 	_, err := url.Parse(urlStr)
-	check(err)
+	errors.Check(err)
 
 	c := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	resp, err := c.Get(urlStr)
-	check(err)
+	resp := errors.Must(c.Get(urlStr))
 	defer slogutil.CloseAndLog(ctx, l, resp.Body, slog.LevelError)
 
 	if resp.StatusCode != http.StatusOK {
@@ -46,7 +46,7 @@ func main() {
 
 	hlSvcs := &hlServices{}
 	err = json.NewDecoder(resp.Body).Decode(hlSvcs)
-	check(err)
+	errors.Check(err)
 
 	// Sort all services and rules to make the output more predictable.
 	slices.SortStableFunc(hlSvcs.BlockedServices, func(a, b *hlServicesService) (res int) {
@@ -59,20 +59,20 @@ func main() {
 	// Use another set of delimiters to prevent them interfering with the Go
 	// code.
 	tmpl, err := template.New("main").Delims("<%", "%>").Funcs(template.FuncMap{
-		"isnotlast": func(idx, sliceLen int) (ok bool) { return idx != sliceLen-1 },
+		"isnotlast": func(idx, sliceLen int) (ok bool) {
+			return idx != sliceLen-1
+		},
 	}).Parse(tmplStr)
-	check(err)
+	errors.Check(err)
 
-	f, err := os.OpenFile(
+	f := errors.Must(os.OpenFile(
 		"./internal/filtering/servicelist.go",
 		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
 		0o644,
-	)
-	check(err)
+	))
 	defer slogutil.CloseAndLog(ctx, l, f, slog.LevelError)
 
-	err = tmpl.Execute(f, hlSvcs)
-	check(err)
+	errors.Check(tmpl.Execute(f, hlSvcs))
 }
 
 // tmplStr is the template for the Go source file with the services.
@@ -86,6 +86,12 @@ type blockedService struct {
 	Name    string   ` + "`" + `json:"name"` + "`" + `
 	IconSVG []byte   ` + "`" + `json:"icon_svg"` + "`" + `
 	Rules   []string ` + "`" + `json:"rules"` + "`" + `
+	GroupID string   ` + "`" + `json:"group_id"` + "`" + `
+}
+
+// serviceGroup represents single group of services.
+type serviceGroup struct {
+	ID string ` + "`" + `json:"id"` + "`" + `
 }
 
 // blockedServices contains raw blocked service data.
@@ -97,20 +103,21 @@ var blockedServices = []blockedService{<% $l := len .BlockedServices %>
 	Rules: []string{<% range $s.Rules %>
 		<% printf "%q" . %>,<% end %>
 	},
+	GroupID: <% printf "%q" $s.Group %>,
+}<% if isnotlast $i $l %>, <% end %><% end %>}
+
+// serviceGroups contains raw service group data.
+var serviceGroups = []serviceGroup{<% $l := len .ServiceGroups %>
+	<%- range $i, $s := .ServiceGroups %>{
+	ID: <% printf "%q" $s.ID %>,
 }<% if isnotlast $i $l %>, <% end %><% end %>}
 `
-
-// check is a simple error-checking helper for scripts.
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
 
 // hlServices is the JSON structure for the Hostlists Registry blocked service
 // index.
 type hlServices struct {
 	BlockedServices []*hlServicesService `json:"blocked_services"`
+	ServiceGroups   []*hlServicesGroup   `json:"groups"`
 }
 
 // hlServicesService is the JSON structure for a service in the Hostlists
@@ -120,4 +127,11 @@ type hlServicesService struct {
 	Name    string   `json:"name"`
 	IconSVG string   `json:"icon_svg"`
 	Rules   []string `json:"rules"`
+	Group   string   `json:"group"`
+}
+
+// hlServicesGroup is the JSON structure for a service group in the Hostlists
+// Registry.
+type hlServicesGroup struct {
+	ID string `json:"id"`
 }

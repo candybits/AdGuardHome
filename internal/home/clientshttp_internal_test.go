@@ -15,6 +15,8 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/schedule"
+	"github.com/AdguardTeam/AdGuardHome/internal/whois"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,11 +81,10 @@ func assertClients(tb testing.TB, want, got []*client.Persistent) {
 	slices.SortFunc(want, sortFunc)
 	slices.SortFunc(got, sortFunc)
 
-	slices.CompareFunc(want, got, func(a, b *client.Persistent) (n int) {
-		assert.True(tb, a.EqualIDs(b), "%q doesn't have the same ids as %q", a.Name, b.Name)
-
-		return 0
-	})
+	for i, a := range want {
+		b := got[i]
+		assert.Truef(tb, a.EqualIDs(b), "%q doesn't have the same ids as %q", a.Name, b.Name)
+	}
 }
 
 // assertPersistentClients is a helper function that uses HTTP API to check
@@ -95,17 +96,15 @@ func assertPersistentClients(tb testing.TB, clients *clientsContainer, want []*c
 	rw := httptest.NewRecorder()
 	clients.handleGetClients(rw, &http.Request{})
 
-	body, err := io.ReadAll(rw.Body)
-	require.NoError(tb, err)
-
 	clientList := &clientListJSON{}
-	err = json.Unmarshal(body, clientList)
+	err := json.NewDecoder(rw.Body).Decode(clientList)
 	require.NoError(tb, err)
 
 	var got []*client.Persistent
+	ctx := testutil.ContextWithTimeout(tb, testTimeout)
 	for _, cj := range clientList.Clients {
 		var c *client.Persistent
-		c, err = clients.jsonToClient(*cj, nil)
+		c, err = clients.jsonToClient(ctx, *cj, nil)
 		require.NoError(tb, err)
 
 		got = append(got, c)
@@ -125,10 +124,11 @@ func assertPersistentClientsData(
 	tb.Helper()
 
 	var got []*client.Persistent
+	ctx := testutil.ContextWithTimeout(tb, testTimeout)
 	for _, cm := range data {
 		for _, cj := range cm {
 			var c *client.Persistent
-			c, err := clients.jsonToClient(*cj, nil)
+			c, err := clients.jsonToClient(ctx, *cj, nil)
 			require.NoError(tb, err)
 
 			got = append(got, c)
@@ -145,7 +145,7 @@ func TestClientsContainer_HandleAddClient(t *testing.T) {
 	clientTwo := newPersistentClientWithIDs(t, "client2", []string{testClientIP2})
 
 	clientEmptyID := newPersistentClient("empty_client_id")
-	clientEmptyID.ClientIDs = []string{""}
+	clientEmptyID.ClientIDs = []client.ClientID{""}
 
 	testCases := []struct {
 		name       string
@@ -196,13 +196,14 @@ func TestClientsContainer_HandleAddClient(t *testing.T) {
 
 func TestClientsContainer_HandleDelClient(t *testing.T) {
 	clients := newClientsContainer(t)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
 	clientOne := newPersistentClientWithIDs(t, "client1", []string{testClientIP1})
-	err := clients.storage.Add(clientOne)
+	err := clients.storage.Add(ctx, clientOne)
 	require.NoError(t, err)
 
 	clientTwo := newPersistentClientWithIDs(t, "client2", []string{testClientIP2})
-	err = clients.storage.Add(clientTwo)
+	err = clients.storage.Add(ctx, clientTwo)
 	require.NoError(t, err)
 
 	assertPersistentClients(t, clients, []*client.Persistent{clientOne, clientTwo})
@@ -258,9 +259,10 @@ func TestClientsContainer_HandleDelClient(t *testing.T) {
 
 func TestClientsContainer_HandleUpdateClient(t *testing.T) {
 	clients := newClientsContainer(t)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
 	clientOne := newPersistentClientWithIDs(t, "client1", []string{testClientIP1})
-	err := clients.storage.Add(clientOne)
+	err := clients.storage.Add(ctx, clientOne)
 	require.NoError(t, err)
 
 	assertPersistentClients(t, clients, []*client.Persistent{clientOne})
@@ -268,7 +270,7 @@ func TestClientsContainer_HandleUpdateClient(t *testing.T) {
 	clientModified := newPersistentClientWithIDs(t, "client2", []string{testClientIP2})
 
 	clientEmptyID := newPersistentClient("empty_client_id")
-	clientEmptyID.ClientIDs = []string{""}
+	clientEmptyID.ClientIDs = []client.ClientID{""}
 
 	testCases := []struct {
 		name       string
@@ -341,12 +343,14 @@ func TestClientsContainer_HandleFindClient(t *testing.T) {
 		},
 	}
 
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
 	clientOne := newPersistentClientWithIDs(t, "client1", []string{testClientIP1})
-	err := clients.storage.Add(clientOne)
+	err := clients.storage.Add(ctx, clientOne)
 	require.NoError(t, err)
 
 	clientTwo := newPersistentClientWithIDs(t, "client2", []string{testClientIP2})
-	err = clients.storage.Add(clientTwo)
+	err = clients.storage.Add(ctx, clientTwo)
 	require.NoError(t, err)
 
 	assertPersistentClients(t, clients, []*client.Persistent{clientOne, clientTwo})
@@ -394,6 +398,145 @@ func TestClientsContainer_HandleFindClient(t *testing.T) {
 			require.NoError(t, err)
 
 			assertPersistentClientsData(t, clients, clientData, tc.wantClient)
+		})
+	}
+}
+
+func TestClientsContainer_HandleSearchClient(t *testing.T) {
+	var (
+		runtimeCli = "runtime_client1"
+
+		runtimeCliIP     = "3.3.3.3"
+		blockedCliIP     = "4.4.4.4"
+		nonExistentCliIP = "5.5.5.5"
+
+		allowed     = false
+		dissallowed = true
+
+		disallowedRule = "disallowed_rule"
+	)
+
+	clients := newClientsContainer(t)
+	clients.clientChecker = &testBlockedClientChecker{
+		onIsBlockedClient: func(ip netip.Addr, _ string) (ok bool, rule string) {
+			if ip == netip.MustParseAddr(blockedCliIP) {
+				return true, disallowedRule
+			}
+
+			return false, ""
+		},
+	}
+
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	clientOne := newPersistentClientWithIDs(t, "client1", []string{testClientIP1})
+	err := clients.storage.Add(ctx, clientOne)
+	require.NoError(t, err)
+
+	clientTwo := newPersistentClientWithIDs(t, "client2", []string{testClientIP2})
+	err = clients.storage.Add(ctx, clientTwo)
+	require.NoError(t, err)
+
+	assertPersistentClients(t, clients, []*client.Persistent{clientOne, clientTwo})
+
+	clients.UpdateAddress(ctx, netip.MustParseAddr(runtimeCliIP), runtimeCli, nil)
+
+	testCases := []struct {
+		name           string
+		query          *searchQueryJSON
+		wantPersistent []*client.Persistent
+		wantRuntime    *clientJSON
+	}{{
+		name: "single",
+		query: &searchQueryJSON{
+			Clients: []searchClientJSON{{
+				ID: testClientIP1,
+			}},
+		},
+		wantPersistent: []*client.Persistent{clientOne},
+	}, {
+		name: "multiple",
+		query: &searchQueryJSON{
+			Clients: []searchClientJSON{{
+				ID: testClientIP1,
+			}, {
+				ID: testClientIP2,
+			}},
+		},
+		wantPersistent: []*client.Persistent{clientOne, clientTwo},
+	}, {
+		name: "runtime",
+		query: &searchQueryJSON{
+			Clients: []searchClientJSON{{
+				ID: runtimeCliIP,
+			}},
+		},
+		wantRuntime: &clientJSON{
+			Name:       runtimeCli,
+			IDs:        []string{runtimeCliIP},
+			Disallowed: &allowed,
+			WHOIS:      &whois.Info{},
+		},
+	}, {
+		name: "blocked_access",
+		query: &searchQueryJSON{
+			Clients: []searchClientJSON{{
+				ID: blockedCliIP,
+			}},
+		},
+		wantRuntime: &clientJSON{
+			IDs:            []string{blockedCliIP},
+			Disallowed:     &dissallowed,
+			DisallowedRule: &disallowedRule,
+			WHOIS:          &whois.Info{},
+		},
+	}, {
+		name: "non_existing_client",
+		query: &searchQueryJSON{
+			Clients: []searchClientJSON{{
+				ID: nonExistentCliIP,
+			}},
+		},
+		wantRuntime: &clientJSON{
+			IDs:        []string{nonExistentCliIP},
+			Disallowed: &allowed,
+			WHOIS:      &whois.Info{},
+		},
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body []byte
+			body, err = json.Marshal(tc.query)
+			require.NoError(t, err)
+
+			var r *http.Request
+			r, err = http.NewRequest(http.MethodPost, "", bytes.NewReader(body))
+			require.NoError(t, err)
+
+			rw := httptest.NewRecorder()
+			clients.handleSearchClient(rw, r)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, rw.Code)
+
+			body, err = io.ReadAll(rw.Body)
+			require.NoError(t, err)
+
+			clientData := []map[string]*clientJSON{}
+			err = json.Unmarshal(body, &clientData)
+			require.NoError(t, err)
+
+			if tc.wantPersistent != nil {
+				assertPersistentClientsData(t, clients, clientData, tc.wantPersistent)
+
+				return
+			}
+
+			require.Len(t, clientData, 1)
+			require.Len(t, clientData[0], 1)
+
+			rc := clientData[0][tc.wantRuntime.IDs[0]]
+			assert.Equal(t, tc.wantRuntime, rc)
 		})
 	}
 }

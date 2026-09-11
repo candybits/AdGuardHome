@@ -1,6 +1,7 @@
 package client_test
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"runtime"
@@ -13,12 +14,40 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
+	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/hostsfile"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/service"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/AdguardTeam/golibs/testutil/faketime"
+	"github.com/AdguardTeam/golibs/testutil/servicetest"
+	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// testLogger is a logger used in tests.
+var testLogger = slogutil.NewDiscardLogger()
+
+// newTestStorage is a helper function that returns initialized storage.
+func newTestStorage(tb testing.TB, clock timeutil.Clock) (s *client.Storage) {
+	tb.Helper()
+
+	ctx := testutil.ContextWithTimeout(tb, testTimeout)
+	s, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger: testLogger,
+		Logger:     testLogger,
+		Clock:      clock,
+	})
+	require.NoError(tb, err)
+
+	return s
+}
+
+// type check
+var _ dnsforward.ClientsContainer = (*client.Storage)(nil)
 
 // testHostsContainer is a mock implementation of the [client.HostsContainer]
 // interface.
@@ -37,17 +66,17 @@ func (c *testHostsContainer) Upd() (updates <-chan *hostsfile.DefaultStorage) {
 // Interface stores and refreshes the network neighborhood reported by ARP
 // (Address Resolution Protocol).
 type Interface interface {
-	// Refresh updates the stored data.  It must be safe for concurrent use.
-	Refresh() (err error)
+	// Refresher updates the stored data.  It must be safe for concurrent use.
+	service.Refresher
 
-	// Neighbors returnes the last set of data reported by ARP.  Both the method
+	// Neighbors returns the last set of data reported by ARP.  Both the method
 	// and it's result must be safe for concurrent use.
 	Neighbors() (ns []arpdb.Neighbor)
 }
 
 // testARPDB is a mock implementation of the [arpdb.Interface].
 type testARPDB struct {
-	onRefresh   func() (err error)
+	onRefresh   func(ctx context.Context) (err error)
 	onNeighbors func() (ns []arpdb.Neighbor)
 }
 
@@ -55,8 +84,8 @@ type testARPDB struct {
 var _ arpdb.Interface = (*testARPDB)(nil)
 
 // Refresh implements the [arpdb.Interface] interface for *testARP.
-func (c *testARPDB) Refresh() (err error) {
-	return c.onRefresh()
+func (c *testARPDB) Refresh(ctx context.Context) (err error) {
+	return c.onRefresh(ctx)
 }
 
 // Neighbors implements the [arpdb.Interface] interface for *testARP.
@@ -110,68 +139,62 @@ func TestStorage_Add_hostsfile(t *testing.T) {
 		onUpd: func() (updates <-chan *hostsfile.DefaultStorage) { return hostCh },
 	}
 
-	storage, err := client.NewStorage(&client.StorageConfig{
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	storage, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger:             testLogger,
+		Logger:                 testLogger,
 		DHCP:                   client.EmptyDHCP{},
 		EtcHosts:               h,
 		ARPClientsUpdatePeriod: testTimeout / 10,
 	})
 	require.NoError(t, err)
 
-	err = storage.Start(testutil.ContextWithTimeout(t, testTimeout))
-	require.NoError(t, err)
-
-	testutil.CleanupAndRequireSuccess(t, func() (err error) {
-		return storage.Shutdown(testutil.ContextWithTimeout(t, testTimeout))
-	})
+	servicetest.RequireRun(t, storage, testTimeout)
 
 	t.Run("add_hosts", func(t *testing.T) {
 		var s *hostsfile.DefaultStorage
-		s, err = hostsfile.NewDefaultStorage()
+		s, err = hostsfile.NewDefaultStorage(ctx, &hostsfile.DefaultStorageConfig{
+			Logger: testLogger,
+		})
 		require.NoError(t, err)
 
-		s.Add(&hostsfile.Record{
+		s.Add(ctx, &hostsfile.Record{
 			Addr:  cliIP1,
 			Names: []string{cliName1},
 		})
 
 		testutil.RequireSend(t, hostCh, s, testTimeout)
 
-		require.Eventually(t, func() (ok bool) {
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
 			cli1 := storage.ClientRuntime(cliIP1)
-			if cli1 == nil {
-				return false
-			}
+			require.NotNil(ct, cli1)
 
-			assert.True(t, compareRuntimeInfo(cli1, client.SourceHostsFile, cliName1))
-
-			return true
+			assert.True(ct, compareRuntimeInfo(cli1, client.SourceHostsFile, cliName1))
 		}, testTimeout, testTimeout/10)
 	})
 
 	t.Run("update_hosts", func(t *testing.T) {
 		var s *hostsfile.DefaultStorage
-		s, err = hostsfile.NewDefaultStorage()
+		s, err = hostsfile.NewDefaultStorage(ctx, &hostsfile.DefaultStorageConfig{
+			Logger: testLogger,
+		})
 		require.NoError(t, err)
 
-		s.Add(&hostsfile.Record{
+		s.Add(ctx, &hostsfile.Record{
 			Addr:  cliIP2,
 			Names: []string{cliName2},
 		})
 
 		testutil.RequireSend(t, hostCh, s, testTimeout)
 
-		require.Eventually(t, func() (ok bool) {
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
 			cli2 := storage.ClientRuntime(cliIP2)
-			if cli2 == nil {
-				return false
-			}
+			require.NotNil(ct, cli2)
 
-			assert.True(t, compareRuntimeInfo(cli2, client.SourceHostsFile, cliName2))
+			assert.True(ct, compareRuntimeInfo(cli2, client.SourceHostsFile, cliName2))
 
 			cli1 := storage.ClientRuntime(cliIP1)
-			require.Nil(t, cli1)
-
-			return true
+			require.Nil(ct, cli1)
 		}, testTimeout, testTimeout/10)
 	})
 }
@@ -189,7 +212,7 @@ func TestStorage_Add_arp(t *testing.T) {
 	)
 
 	a := &testARPDB{
-		onRefresh: func() (err error) { return nil },
+		onRefresh: func(_ context.Context) (err error) { return nil },
 		onNeighbors: func() (ns []arpdb.Neighbor) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -198,19 +221,17 @@ func TestStorage_Add_arp(t *testing.T) {
 		},
 	}
 
-	storage, err := client.NewStorage(&client.StorageConfig{
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	storage, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger:             testLogger,
+		Logger:                 testLogger,
 		DHCP:                   client.EmptyDHCP{},
 		ARPDB:                  a,
 		ARPClientsUpdatePeriod: testTimeout / 10,
 	})
 	require.NoError(t, err)
 
-	err = storage.Start(testutil.ContextWithTimeout(t, testTimeout))
-	require.NoError(t, err)
-
-	testutil.CleanupAndRequireSuccess(t, func() (err error) {
-		return storage.Shutdown(testutil.ContextWithTimeout(t, testTimeout))
-	})
+	servicetest.RequireRun(t, storage, testTimeout)
 
 	t.Run("add_hosts", func(t *testing.T) {
 		func() {
@@ -223,15 +244,11 @@ func TestStorage_Add_arp(t *testing.T) {
 			}}
 		}()
 
-		require.Eventually(t, func() (ok bool) {
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
 			cli1 := storage.ClientRuntime(cliIP1)
-			if cli1 == nil {
-				return false
-			}
+			require.NotNil(ct, cli1)
 
-			assert.True(t, compareRuntimeInfo(cli1, client.SourceARP, cliName1))
-
-			return true
+			assert.True(ct, compareRuntimeInfo(cli1, client.SourceARP, cliName1))
 		}, testTimeout, testTimeout/10)
 	})
 
@@ -246,18 +263,14 @@ func TestStorage_Add_arp(t *testing.T) {
 			}}
 		}()
 
-		require.Eventually(t, func() (ok bool) {
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
 			cli2 := storage.ClientRuntime(cliIP2)
-			if cli2 == nil {
-				return false
-			}
+			require.NotNil(ct, cli2)
 
-			assert.True(t, compareRuntimeInfo(cli2, client.SourceARP, cliName2))
+			assert.True(ct, compareRuntimeInfo(cli2, client.SourceARP, cliName2))
 
 			cli1 := storage.ClientRuntime(cliIP1)
-			require.Nil(t, cli1)
-
-			return true
+			require.Nil(ct, cli1)
 		}, testTimeout, testTimeout/10)
 	})
 }
@@ -273,8 +286,11 @@ func TestStorage_Add_whois(t *testing.T) {
 		cliName3 = "client_three"
 	)
 
-	storage, err := client.NewStorage(&client.StorageConfig{
-		DHCP: client.EmptyDHCP{},
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	storage, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger: testLogger,
+		Logger:     testLogger,
+		DHCP:       client.EmptyDHCP{},
 	})
 	require.NoError(t, err)
 
@@ -284,7 +300,7 @@ func TestStorage_Add_whois(t *testing.T) {
 	}
 
 	t.Run("new_client", func(t *testing.T) {
-		storage.UpdateAddress(cliIP1, "", whois)
+		storage.UpdateAddress(ctx, cliIP1, "", whois)
 		cli1 := storage.ClientRuntime(cliIP1)
 		require.NotNil(t, cli1)
 
@@ -292,8 +308,8 @@ func TestStorage_Add_whois(t *testing.T) {
 	})
 
 	t.Run("existing_runtime_client", func(t *testing.T) {
-		storage.UpdateAddress(cliIP2, cliName2, nil)
-		storage.UpdateAddress(cliIP2, "", whois)
+		storage.UpdateAddress(ctx, cliIP2, cliName2, nil)
+		storage.UpdateAddress(ctx, cliIP2, "", whois)
 
 		cli2 := storage.ClientRuntime(cliIP2)
 		require.NotNil(t, cli2)
@@ -304,14 +320,14 @@ func TestStorage_Add_whois(t *testing.T) {
 	})
 
 	t.Run("can't_set_persistent_client", func(t *testing.T) {
-		err = storage.Add(&client.Persistent{
+		err = storage.Add(ctx, &client.Persistent{
 			Name: cliName3,
 			UID:  client.MustNewUID(),
 			IPs:  []netip.Addr{cliIP3},
 		})
 		require.NoError(t, err)
 
-		storage.UpdateAddress(cliIP3, "", whois)
+		storage.UpdateAddress(ctx, cliIP3, "", whois)
 		rc := storage.ClientRuntime(cliIP3)
 		require.Nil(t, rc)
 	})
@@ -323,16 +339,19 @@ func TestClientsDHCP(t *testing.T) {
 		cliName1 = "one.dhcp"
 
 		cliIP2   = netip.MustParseAddr("2.2.2.2")
-		cliMAC2  = mustParseMAC("22:22:22:22:22:22")
+		cliMAC2  = errors.Must(net.ParseMAC("22:22:22:22:22:22"))
 		cliName2 = "two.dhcp"
 
 		cliIP3   = netip.MustParseAddr("3.3.3.3")
-		cliMAC3  = mustParseMAC("33:33:33:33:33:33")
+		cliMAC3  = errors.Must(net.ParseMAC("33:33:33:33:33:33"))
 		cliName3 = "three.dhcp"
 
 		prsCliIP   = netip.MustParseAddr("4.3.2.1")
-		prsCliMAC  = mustParseMAC("AA:AA:AA:AA:AA:AA")
+		prsCliMAC  = errors.Must(net.ParseMAC("AA:AA:AA:AA:AA:AA"))
 		prsCliName = "persistent.dhcp"
+
+		otherARPCliName = "other.arp"
+		otherARPCliIP   = netip.MustParseAddr("192.0.2.1")
 	)
 
 	ipToHost := map[netip.Addr]string{
@@ -352,7 +371,20 @@ func TestClientsDHCP(t *testing.T) {
 		HWAddr:   cliMAC3,
 	}}
 
-	d := &testDHCP{
+	arpCh := make(chan []arpdb.Neighbor, 1)
+	arpDB := &testARPDB{
+		onRefresh: func(_ context.Context) (err error) { return nil },
+		onNeighbors: func() (ns []arpdb.Neighbor) {
+			select {
+			case ns = <-arpCh:
+				return ns
+			default:
+				return nil
+			}
+		},
+	}
+
+	dhcp := &testDHCP{
 		OnLeases: func() (ls []*dhcpsvc.Lease) {
 			return leases
 		},
@@ -364,36 +396,128 @@ func TestClientsDHCP(t *testing.T) {
 		},
 	}
 
-	storage, err := client.NewStorage(&client.StorageConfig{
-		DHCP:              d,
-		RuntimeSourceDHCP: true,
+	etcHostsCh := make(chan *hostsfile.DefaultStorage, 1)
+	etcHosts := &testHostsContainer{
+		onUpd: func() (updates <-chan *hostsfile.DefaultStorage) {
+			return etcHostsCh
+		},
+	}
+
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	storage, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger:             testLogger,
+		Logger:                 testLogger,
+		ARPDB:                  arpDB,
+		DHCP:                   dhcp,
+		EtcHosts:               etcHosts,
+		RuntimeSourceDHCP:      true,
+		ARPClientsUpdatePeriod: testTimeout / 10,
 	})
 	require.NoError(t, err)
 
-	t.Run("find_runtime", func(t *testing.T) {
+	servicetest.RequireRun(t, storage, testTimeout)
+
+	require.True(t, t.Run("find_runtime_lower_priority", func(t *testing.T) {
+		// Add a lower-priority client.
+		ns := []arpdb.Neighbor{{
+			Name: cliName1,
+			IP:   cliIP1,
+		}}
+
+		testutil.RequireSend(t, arpCh, ns, testTimeout)
+
+		storage.ReloadARP(testutil.ContextWithTimeout(t, testTimeout))
+
 		cli1 := storage.ClientRuntime(cliIP1)
 		require.NotNil(t, cli1)
 
 		assert.True(t, compareRuntimeInfo(cli1, client.SourceDHCP, cliName1))
-	})
 
-	t.Run("find_persistent", func(t *testing.T) {
-		err = storage.Add(&client.Persistent{
+		// Remove the matching client.
+		//
+		// TODO(a.garipov):  Consider adding ways of explicitly clearing runtime
+		// sources by source.
+		ns = []arpdb.Neighbor{{
+			Name: otherARPCliName,
+			IP:   otherARPCliIP,
+		}}
+
+		testutil.RequireSend(t, arpCh, ns, testTimeout)
+
+		storage.ReloadARP(testutil.ContextWithTimeout(t, testTimeout))
+	}))
+
+	require.True(t, t.Run("find_runtime", func(t *testing.T) {
+		cli1 := storage.ClientRuntime(cliIP1)
+		require.NotNil(t, cli1)
+
+		assert.True(t, compareRuntimeInfo(cli1, client.SourceDHCP, cliName1))
+	}))
+
+	require.True(t, t.Run("find_runtime_higher_priority", func(t *testing.T) {
+		// Add a higher-priority client.
+		s, strgErr := hostsfile.NewDefaultStorage(ctx, &hostsfile.DefaultStorageConfig{
+			Logger: testLogger,
+		})
+		require.NoError(t, strgErr)
+
+		s.Add(ctx, &hostsfile.Record{
+			Addr:  cliIP1,
+			Names: []string{cliName1},
+		})
+
+		testutil.RequireSend(t, etcHostsCh, s, testTimeout)
+
+		cli1 := storage.ClientRuntime(cliIP1)
+		require.NotNil(t, cli1)
+
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			cli := storage.ClientRuntime(cliIP1)
+			require.NotNil(ct, cli)
+
+			assert.True(ct, compareRuntimeInfo(cli, client.SourceHostsFile, cliName1))
+		}, testTimeout, testTimeout/10)
+
+		// Remove the matching client.
+		//
+		// TODO(a.garipov):  Consider adding ways of explicitly clearing runtime
+		// sources by source.
+		s, strgErr = hostsfile.NewDefaultStorage(ctx, &hostsfile.DefaultStorageConfig{
+			Logger: testLogger,
+		})
+		require.NoError(t, strgErr)
+
+		testutil.RequireSend(t, etcHostsCh, s, testTimeout)
+
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			cli := storage.ClientRuntime(cliIP1)
+			require.NotNil(ct, cli)
+
+			assert.True(ct, compareRuntimeInfo(cli, client.SourceDHCP, cliName1))
+		}, testTimeout, testTimeout/10)
+	}))
+
+	require.True(t, t.Run("find_persistent", func(t *testing.T) {
+		err = storage.Add(ctx, &client.Persistent{
 			Name: prsCliName,
 			UID:  client.MustNewUID(),
 			MACs: []net.HardwareAddr{prsCliMAC},
 		})
 		require.NoError(t, err)
 
-		prsCli, ok := storage.Find(prsCliIP.String())
+		params := &client.FindParams{}
+		err = params.Set(prsCliIP.String())
+		require.NoError(t, err)
+
+		prsCli, ok := storage.Find(params)
 		require.True(t, ok)
 
 		assert.Equal(t, prsCliName, prsCli.Name)
-	})
+	}))
 
-	t.Run("leases", func(t *testing.T) {
+	require.True(t, t.Run("leases", func(t *testing.T) {
 		delete(ipToHost, cliIP1)
-		storage.UpdateDHCP()
+		storage.UpdateDHCP(ctx)
 
 		cli1 := storage.ClientRuntime(cliIP1)
 		require.Nil(t, cli1)
@@ -406,31 +530,37 @@ func TestClientsDHCP(t *testing.T) {
 			assert.Equal(t, client.SourceDHCP, src)
 			assert.Equal(t, leases[i].Hostname, host)
 		}
-	})
+	}))
 
-	t.Run("range", func(t *testing.T) {
+	require.True(t, t.Run("range", func(t *testing.T) {
 		s := 0
 		storage.RangeRuntime(func(rc *client.Runtime) (cont bool) {
-			s++
+			if src, _ := rc.Info(); src == client.SourceDHCP {
+				s++
+			}
 
 			return true
 		})
 
 		assert.Equal(t, len(leases), s)
-	})
+	}))
 }
 
 func TestClientsAddExisting(t *testing.T) {
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
 	t.Run("simple", func(t *testing.T) {
-		storage, err := client.NewStorage(&client.StorageConfig{
-			DHCP: client.EmptyDHCP{},
+		storage, err := client.NewStorage(ctx, &client.StorageConfig{
+			BaseLogger: testLogger,
+			Logger:     testLogger,
+			DHCP:       client.EmptyDHCP{},
 		})
 		require.NoError(t, err)
 
 		ip := netip.MustParseAddr("1.1.1.1")
 
 		// Add a client.
-		err = storage.Add(&client.Persistent{
+		err = storage.Add(ctx, &client.Persistent{
 			Name:    "client1",
 			UID:     client.MustNewUID(),
 			IPs:     []netip.Addr{ip, netip.MustParseAddr("1:2:3::4")},
@@ -440,7 +570,7 @@ func TestClientsAddExisting(t *testing.T) {
 		require.NoError(t, err)
 
 		// Now add an auto-client with the same IP.
-		storage.UpdateAddress(ip, "test", nil)
+		storage.UpdateAddress(ctx, ip, "test", nil)
 		rc := storage.ClientRuntime(ip)
 		assert.True(t, compareRuntimeInfo(rc, client.SourceRDNS, "test"))
 	})
@@ -454,6 +584,7 @@ func TestClientsAddExisting(t *testing.T) {
 
 		// First, init a DHCP server with a single static lease.
 		config := &dhcpd.ServerConfig{
+			Logger:  testLogger,
 			Enabled: true,
 			DataDir: t.TempDir(),
 			Conf4: dhcpd.V4ServerConf{
@@ -465,11 +596,14 @@ func TestClientsAddExisting(t *testing.T) {
 			},
 		}
 
-		dhcpServer, err := dhcpd.Create(config)
+		ctx = testutil.ContextWithTimeout(t, testTimeout)
+		dhcpServer, err := dhcpd.Create(ctx, config)
 		require.NoError(t, err)
 
-		storage, err := client.NewStorage(&client.StorageConfig{
-			DHCP: dhcpServer,
+		storage, err := client.NewStorage(ctx, &client.StorageConfig{
+			BaseLogger: testLogger,
+			Logger:     testLogger,
+			DHCP:       dhcpServer,
 		})
 		require.NoError(t, err)
 
@@ -484,7 +618,7 @@ func TestClientsAddExisting(t *testing.T) {
 		require.NoError(t, err)
 
 		// Add a new client with the same IP as for a client with MAC.
-		err = storage.Add(&client.Persistent{
+		err = storage.Add(ctx, &client.Persistent{
 			Name: "client2",
 			UID:  client.MustNewUID(),
 			IPs:  []netip.Addr{ip},
@@ -492,7 +626,7 @@ func TestClientsAddExisting(t *testing.T) {
 		require.NoError(t, err)
 
 		// Add a new client with the IP from the first client's IP range.
-		err = storage.Add(&client.Persistent{
+		err = storage.Add(ctx, &client.Persistent{
 			Name: "client3",
 			UID:  client.MustNewUID(),
 			IPs:  []netip.Addr{netip.MustParseAddr("2.2.2.2")},
@@ -506,30 +640,22 @@ func TestClientsAddExisting(t *testing.T) {
 func newStorage(tb testing.TB, m []*client.Persistent) (s *client.Storage) {
 	tb.Helper()
 
-	s, err := client.NewStorage(&client.StorageConfig{
-		DHCP: client.EmptyDHCP{},
+	ctx := testutil.ContextWithTimeout(tb, testTimeout)
+	s, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger: testLogger,
+		Logger:     testLogger,
+		DHCP:       client.EmptyDHCP{},
 	})
 	require.NoError(tb, err)
 
 	for _, c := range m {
 		c.UID = client.MustNewUID()
-		require.NoError(tb, s.Add(c))
+		require.NoError(tb, s.Add(ctx, c))
 	}
 
 	require.Equal(tb, len(m), s.Size())
 
 	return s
-}
-
-// mustParseMAC is wrapper around [net.ParseMAC] that panics if there is an
-// error.
-func mustParseMAC(s string) (mac net.HardwareAddr) {
-	mac, err := net.ParseMAC(s)
-	if err != nil {
-		panic(err)
-	}
-
-	return mac
 }
 
 func TestStorage_Add(t *testing.T) {
@@ -551,13 +677,12 @@ func TestStorage_Add(t *testing.T) {
 		Name:      existingName,
 		IPs:       []netip.Addr{existingIP},
 		Subnets:   []netip.Prefix{existingSubnet},
-		ClientIDs: []string{existingClientID},
+		ClientIDs: []client.ClientID{existingClientID},
 		UID:       existingClientUID,
 	}
 
-	s, err := client.NewStorage(&client.StorageConfig{})
-	require.NoError(t, err)
-
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	s := newTestStorage(t, timeutil.SystemClock{})
 	tags := s.AllowedTags()
 	require.NotZero(t, len(tags))
 	require.True(t, slices.IsSorted(tags))
@@ -568,7 +693,7 @@ func TestStorage_Add(t *testing.T) {
 	_, ok = slices.BinarySearch(tags, notAllowedTag)
 	require.False(t, ok)
 
-	err = s.Add(existingClient)
+	err := s.Add(ctx, existingClient)
 	require.NoError(t, err)
 
 	testCases := []struct {
@@ -620,7 +745,7 @@ func TestStorage_Add(t *testing.T) {
 		name: "duplicate_client_id",
 		cli: &client.Persistent{
 			Name:      "duplicate_client_id",
-			ClientIDs: []string{existingClientID},
+			ClientIDs: []client.ClientID{existingClientID},
 			UID:       client.MustNewUID(),
 		},
 		wantErrMsg: `adding client: another client "existing_name" ` +
@@ -669,7 +794,7 @@ func TestStorage_Add(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err = s.Add(tc.cli)
+			err = s.Add(ctx, tc.cli)
 
 			testutil.AssertErrorMsg(t, tc.wantErrMsg, err)
 		})
@@ -687,10 +812,9 @@ func TestStorage_RemoveByName(t *testing.T) {
 		UID:  client.MustNewUID(),
 	}
 
-	s, err := client.NewStorage(&client.StorageConfig{})
-	require.NoError(t, err)
-
-	err = s.Add(existingClient)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	s := newTestStorage(t, timeutil.SystemClock{})
+	err := s.Add(ctx, existingClient)
 	require.NoError(t, err)
 
 	testCases := []struct {
@@ -709,19 +833,17 @@ func TestStorage_RemoveByName(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.want(t, s.RemoveByName(tc.cliName))
+			tc.want(t, s.RemoveByName(ctx, tc.cliName))
 		})
 	}
 
 	t.Run("duplicate_remove", func(t *testing.T) {
-		s, err = client.NewStorage(&client.StorageConfig{})
+		s = newTestStorage(t, timeutil.SystemClock{})
+		err = s.Add(ctx, existingClient)
 		require.NoError(t, err)
 
-		err = s.Add(existingClient)
-		require.NoError(t, err)
-
-		assert.True(t, s.RemoveByName(existingName))
-		assert.False(t, s.RemoveByName(existingName))
+		assert.True(t, s.RemoveByName(ctx, existingName))
+		assert.False(t, s.RemoveByName(ctx, existingName))
 	})
 }
 
@@ -760,12 +882,12 @@ func TestStorage_Find(t *testing.T) {
 
 		clientWithMAC = &client.Persistent{
 			Name: "client_with_mac",
-			MACs: []net.HardwareAddr{mustParseMAC(cliMAC)},
+			MACs: []net.HardwareAddr{errors.Must(net.ParseMAC(cliMAC))},
 		}
 
 		clientWithID = &client.Persistent{
 			Name:      "client_with_id",
-			ClientIDs: []string{cliID},
+			ClientIDs: []client.ClientID{cliID},
 		}
 
 		clientLinkLocal = &client.Persistent{
@@ -812,7 +934,11 @@ func TestStorage_Find(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, id := range tc.ids {
-				c, ok := s.Find(id)
+				params := &client.FindParams{}
+				err := params.Set(id)
+				require.NoError(t, err)
+
+				c, ok := s.Find(params)
 				require.True(t, ok)
 
 				assert.Equal(t, tc.want, c)
@@ -821,7 +947,11 @@ func TestStorage_Find(t *testing.T) {
 	}
 
 	t.Run("not_found", func(t *testing.T) {
-		_, ok := s.Find(cliIPNone)
+		params := &client.FindParams{}
+		err := params.Set(cliIPNone)
+		require.NoError(t, err)
+
+		_, ok := s.Find(params)
 		assert.False(t, ok)
 	})
 }
@@ -887,127 +1017,6 @@ func TestStorage_FindLoose(t *testing.T) {
 	}
 }
 
-func TestStorage_FindByName(t *testing.T) {
-	const (
-		cliIP1 = "1.1.1.1"
-		cliIP2 = "2.2.2.2"
-	)
-
-	const (
-		clientExistingName        = "client_existing"
-		clientAnotherExistingName = "client_another_existing"
-		nonExistingClientName     = "client_non_existing"
-	)
-
-	var (
-		clientExisting = &client.Persistent{
-			Name: clientExistingName,
-			IPs:  []netip.Addr{netip.MustParseAddr(cliIP1)},
-		}
-
-		clientAnotherExisting = &client.Persistent{
-			Name: clientAnotherExistingName,
-			IPs:  []netip.Addr{netip.MustParseAddr(cliIP2)},
-		}
-	)
-
-	clients := []*client.Persistent{
-		clientExisting,
-		clientAnotherExisting,
-	}
-	s := newStorage(t, clients)
-
-	testCases := []struct {
-		want       *client.Persistent
-		name       string
-		clientName string
-	}{{
-		name:       "existing",
-		clientName: clientExistingName,
-		want:       clientExisting,
-	}, {
-		name:       "another_existing",
-		clientName: clientAnotherExistingName,
-		want:       clientAnotherExisting,
-	}, {
-		name:       "non_existing",
-		clientName: nonExistingClientName,
-		want:       nil,
-	}}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			c, ok := s.FindByName(tc.clientName)
-			if tc.want == nil {
-				assert.False(t, ok)
-
-				return
-			}
-
-			assert.True(t, ok)
-			assert.Equal(t, tc.want, c)
-		})
-	}
-}
-
-func TestStorage_FindByMAC(t *testing.T) {
-	var (
-		cliMAC               = mustParseMAC("11:11:11:11:11:11")
-		cliAnotherMAC        = mustParseMAC("22:22:22:22:22:22")
-		nonExistingClientMAC = mustParseMAC("33:33:33:33:33:33")
-	)
-
-	var (
-		clientExisting = &client.Persistent{
-			Name: "client",
-			MACs: []net.HardwareAddr{cliMAC},
-		}
-
-		clientAnotherExisting = &client.Persistent{
-			Name: "another_client",
-			MACs: []net.HardwareAddr{cliAnotherMAC},
-		}
-	)
-
-	clients := []*client.Persistent{
-		clientExisting,
-		clientAnotherExisting,
-	}
-	s := newStorage(t, clients)
-
-	testCases := []struct {
-		want      *client.Persistent
-		name      string
-		clientMAC net.HardwareAddr
-	}{{
-		name:      "existing",
-		clientMAC: cliMAC,
-		want:      clientExisting,
-	}, {
-		name:      "another_existing",
-		clientMAC: cliAnotherMAC,
-		want:      clientAnotherExisting,
-	}, {
-		name:      "non_existing",
-		clientMAC: nonExistingClientMAC,
-		want:      nil,
-	}}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			c, ok := s.FindByMAC(tc.clientMAC)
-			if tc.want == nil {
-				assert.False(t, ok)
-
-				return
-			}
-
-			assert.True(t, ok)
-			assert.Equal(t, tc.want, c)
-		})
-	}
-}
-
 func TestStorage_Update(t *testing.T) {
 	const (
 		clientName          = "client_name"
@@ -1024,7 +1033,7 @@ func TestStorage_Update(t *testing.T) {
 		Name:      obstructingName,
 		IPs:       []netip.Addr{obstructingIP},
 		Subnets:   []netip.Prefix{obstructingSubnet},
-		ClientIDs: []string{obstructingClientID},
+		ClientIDs: []client.ClientID{obstructingClientID},
 	}
 
 	clientToUpdate := &client.Persistent{
@@ -1073,13 +1082,14 @@ func TestStorage_Update(t *testing.T) {
 		name: "duplicate_client_id",
 		cli: &client.Persistent{
 			Name:      "duplicate_client_id",
-			ClientIDs: []string{obstructingClientID},
+			ClientIDs: []client.ClientID{obstructingClientID},
 			UID:       client.MustNewUID(),
 		},
 		wantErrMsg: `updating client: another client "obstructing_name" ` +
 			`uses the same ClientID "obstructing_client_id"`,
 	}}
 
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newStorage(
@@ -1090,7 +1100,7 @@ func TestStorage_Update(t *testing.T) {
 				},
 			)
 
-			err := s.Update(clientName, tc.cli)
+			err := s.Update(ctx, clientName, tc.cli)
 			testutil.AssertErrorMsg(t, tc.wantErrMsg, err)
 		})
 	}
@@ -1099,19 +1109,19 @@ func TestStorage_Update(t *testing.T) {
 func TestStorage_RangeByName(t *testing.T) {
 	sortedClients := []*client.Persistent{{
 		Name:      "clientA",
-		ClientIDs: []string{"A"},
+		ClientIDs: []client.ClientID{"A"},
 	}, {
 		Name:      "clientB",
-		ClientIDs: []string{"B"},
+		ClientIDs: []client.ClientID{"B"},
 	}, {
 		Name:      "clientC",
-		ClientIDs: []string{"C"},
+		ClientIDs: []client.ClientID{"C"},
 	}, {
 		Name:      "clientD",
-		ClientIDs: []string{"D"},
+		ClientIDs: []client.ClientID{"D"},
 	}, {
 		Name:      "clientE",
-		ClientIDs: []string{"E"},
+		ClientIDs: []client.ClientID{"E"},
 	}}
 
 	testCases := []struct {
@@ -1145,4 +1155,318 @@ func TestStorage_RangeByName(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestStorage_CustomUpstreamConfig(t *testing.T) {
+	const (
+		existingClientID    = "existing_client_id"
+		nonExistingClientID = "non_existing_client_id"
+	)
+
+	var (
+		existingIP    = netip.MustParseAddr("192.0.2.1")
+		nonExistingIP = netip.MustParseAddr("192.0.2.255")
+
+		dhcpCliIP  = netip.MustParseAddr("192.0.2.2")
+		dhcpCliMAC = errors.Must(net.ParseMAC("02:00:00:00:00:00"))
+
+		testUpstreamTimeout = time.Second
+	)
+
+	date := time.Now()
+	clock := &faketime.Clock{
+		OnNow: func() (now time.Time) {
+			date = date.Add(time.Second)
+
+			return date
+		},
+	}
+
+	ipToMAC := map[netip.Addr]net.HardwareAddr{
+		dhcpCliIP: dhcpCliMAC,
+	}
+
+	dhcp := &testDHCP{
+		OnLeases: func() (_ []*dhcpsvc.Lease) { panic(testutil.UnexpectedCall()) },
+		OnHostBy: func(ip netip.Addr) (_ string) { panic(testutil.UnexpectedCall(ip)) },
+		OnMACBy: func(ip netip.Addr) (mac net.HardwareAddr) {
+			return ipToMAC[ip]
+		},
+	}
+
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	s, err := client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger: testLogger,
+		Logger:     testLogger,
+		Clock:      clock,
+		DHCP:       dhcp,
+	})
+	require.NoError(t, err)
+
+	s.UpdateCommonUpstreamConfig(&client.CommonUpstreamConfig{
+		UpstreamTimeout: testUpstreamTimeout,
+	})
+
+	testutil.CleanupAndRequireSuccess(t, func() (err error) {
+		return s.Shutdown(testutil.ContextWithTimeout(t, testTimeout))
+	})
+
+	err = s.Add(ctx, &client.Persistent{
+		Name:      "client_first",
+		IPs:       []netip.Addr{existingIP},
+		ClientIDs: []client.ClientID{existingClientID},
+		UID:       client.MustNewUID(),
+		Upstreams: []string{"192.0.2.0"},
+	})
+	require.NoError(t, err)
+
+	err = s.Add(ctx, &client.Persistent{
+		Name:      "client_second",
+		MACs:      []net.HardwareAddr{dhcpCliMAC},
+		UID:       client.MustNewUID(),
+		Upstreams: []string{"192.0.2.0"},
+	})
+	require.NoError(t, err)
+
+	testCases := []struct {
+		cliAddr     netip.Addr
+		wantNilConf assert.ValueAssertionFunc
+		name        string
+		cliID       string
+	}{{
+		name:        "client_id",
+		cliID:       existingClientID,
+		cliAddr:     netip.Addr{},
+		wantNilConf: assert.NotNil,
+	}, {
+		name:        "client_addr",
+		cliID:       "",
+		cliAddr:     existingIP,
+		wantNilConf: assert.NotNil,
+	}, {
+		name:        "client_dhcp",
+		cliID:       "",
+		cliAddr:     dhcpCliIP,
+		wantNilConf: assert.NotNil,
+	}, {
+		name:        "non_existing_client_id",
+		cliID:       nonExistingClientID,
+		cliAddr:     netip.Addr{},
+		wantNilConf: assert.Nil,
+	}, {
+		name:        "non_existing_client_addr",
+		cliID:       "",
+		cliAddr:     nonExistingIP,
+		wantNilConf: assert.Nil,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := s.CustomUpstreamConfig(tc.cliID, tc.cliAddr)
+			tc.wantNilConf(t, conf)
+		})
+	}
+
+	t.Run("update_common_config", func(t *testing.T) {
+		conf := s.CustomUpstreamConfig(existingClientID, existingIP)
+		require.NotNil(t, conf)
+
+		s.UpdateCommonUpstreamConfig(&client.CommonUpstreamConfig{
+			UpstreamTimeout: testUpstreamTimeout * 2,
+		})
+
+		updConf := s.CustomUpstreamConfig(existingClientID, existingIP)
+		require.NotNil(t, updConf)
+
+		assert.NotEqual(t, conf, updConf)
+	})
+
+	t.Run("same_custom_config", func(t *testing.T) {
+		firstConf := s.CustomUpstreamConfig(existingClientID, existingIP)
+		require.NotNil(t, firstConf)
+
+		secondConf := s.CustomUpstreamConfig(existingClientID, existingIP)
+		require.NotNil(t, secondConf)
+
+		assert.Same(t, firstConf, secondConf)
+	})
+}
+
+func BenchmarkFindParams_Set(b *testing.B) {
+	const (
+		testIPStr    = "192.0.2.1"
+		testCIDRStr  = "192.0.2.0/24"
+		testMACStr   = "02:00:00:00:00:00"
+		testClientID = "clientid"
+	)
+
+	benchCases := []struct {
+		wantErr error
+		params  *client.FindParams
+		name    string
+		id      string
+	}{{
+		wantErr: nil,
+		params: &client.FindParams{
+			ClientID: testClientID,
+		},
+		name: "client_id",
+		id:   testClientID,
+	}, {
+		wantErr: nil,
+		params: &client.FindParams{
+			RemoteIP: netip.MustParseAddr(testIPStr),
+		},
+		name: "ip_address",
+		id:   testIPStr,
+	}, {
+		wantErr: nil,
+		params: &client.FindParams{
+			Subnet: netip.MustParsePrefix(testCIDRStr),
+		},
+		name: "subnet",
+		id:   testCIDRStr,
+	}, {
+		wantErr: nil,
+		params: &client.FindParams{
+			MAC: errors.Must(net.ParseMAC(testMACStr)),
+		},
+		name: "mac_address",
+		id:   testMACStr,
+	}, {
+		wantErr: client.ErrBadIdentifier,
+		params:  &client.FindParams{},
+		name:    "bad_id",
+		id:      "!@#$%^&*()_+",
+	}}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			params := &client.FindParams{}
+			var err error
+
+			b.ReportAllocs()
+			for b.Loop() {
+				err = params.Set(bc.id)
+			}
+
+			assert.ErrorIs(b, err, bc.wantErr)
+			assert.Equal(b, bc.params, params)
+		})
+	}
+
+	// Most recent results:
+	//
+	//	goos: linux
+	//	goarch: amd64
+	//	pkg: github.com/AdguardTeam/AdGuardHome/internal/client
+	//	cpu: Intel(R) Core(TM) i7-10510U CPU @ 1.80GHz
+	//	BenchmarkFindParams_Set/client_id-8         	49463488	        24.27 ns/op	       0 B/op	       0 allocs/op
+	//	BenchmarkFindParams_Set/ip_address-8        	18740977	        62.22 ns/op	       0 B/op	       0 allocs/op
+	//	BenchmarkFindParams_Set/subnet-8            	10848192	       110.0 ns/op	       0 B/op	       0 allocs/op
+	//	BenchmarkFindParams_Set/mac_address-8       	 8148494	       133.2 ns/op	       8 B/op	       1 allocs/op
+	//	BenchmarkFindParams_Set/bad_id-8            	73894278	        16.29 ns/op	       0 B/op	       0 allocs/op
+}
+
+func BenchmarkStorage_Find(b *testing.B) {
+	const (
+		cliID  = "cid"
+		cliMAC = "02:00:00:00:00:00"
+	)
+
+	const (
+		cliNameWithID   = "client_with_id"
+		cliNameWithIP   = "client_with_ip"
+		cliNameWithCIDR = "client_with_cidr"
+		cliNameWithMAC  = "client_with_mac"
+	)
+
+	var (
+		cliIP   = netip.MustParseAddr("192.0.2.1")
+		cliCIDR = netip.MustParsePrefix("192.0.2.0/24")
+	)
+
+	var (
+		clientWithID = &client.Persistent{
+			Name:      cliNameWithID,
+			ClientIDs: []client.ClientID{cliID},
+		}
+		clientWithIP = &client.Persistent{
+			Name: cliNameWithIP,
+			IPs:  []netip.Addr{cliIP},
+		}
+		clientWithCIDR = &client.Persistent{
+			Name:    cliNameWithCIDR,
+			Subnets: []netip.Prefix{cliCIDR},
+		}
+		clientWithMAC = &client.Persistent{
+			Name: cliNameWithMAC,
+			MACs: []net.HardwareAddr{errors.Must(net.ParseMAC(cliMAC))},
+		}
+	)
+
+	clients := []*client.Persistent{
+		clientWithID,
+		clientWithIP,
+		clientWithCIDR,
+		clientWithMAC,
+	}
+	s := newStorage(b, clients)
+
+	benchCases := []struct {
+		params   *client.FindParams
+		name     string
+		wantName string
+	}{{
+		params: &client.FindParams{
+			ClientID: cliID,
+		},
+		name:     "client_id",
+		wantName: cliNameWithID,
+	}, {
+		params: &client.FindParams{
+			RemoteIP: cliIP,
+		},
+		name:     "ip_address",
+		wantName: cliNameWithIP,
+	}, {
+		params: &client.FindParams{
+			Subnet: cliCIDR,
+		},
+		name:     "subnet",
+		wantName: cliNameWithCIDR,
+	}, {
+		params: &client.FindParams{
+			MAC: errors.Must(net.ParseMAC(cliMAC)),
+		},
+		name:     "mac_address",
+		wantName: cliNameWithMAC,
+	}}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			var p *client.Persistent
+			var ok bool
+
+			b.ReportAllocs()
+			for b.Loop() {
+				p, ok = s.Find(bc.params)
+			}
+
+			assert.True(b, ok)
+			assert.NotNil(b, p)
+			assert.Equal(b, bc.wantName, p.Name)
+		})
+	}
+
+	// Most recent results:
+	//
+	//	goos: linux
+	//	goarch: amd64
+	//	pkg: github.com/AdguardTeam/AdGuardHome/internal/client
+	//	cpu: Intel(R) Core(TM) i7-10510U CPU @ 1.80GHz
+	//	BenchmarkStorage_Find/client_id-8         	 7070107	       154.4 ns/op	     240 B/op	       2 allocs/op
+	//	BenchmarkStorage_Find/ip_address-8        	 6831823	       168.6 ns/op	     248 B/op	       2 allocs/op
+	//	BenchmarkStorage_Find/subnet-8            	 7209050	       167.5 ns/op	     256 B/op	       2 allocs/op
+	//	BenchmarkStorage_Find/mac_address-8       	 5776131	       199.7 ns/op	     256 B/op	       3 allocs/op
 }

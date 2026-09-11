@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -11,10 +12,15 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/arpdb"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
+	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/hostsfile"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/service"
+	"github.com/AdguardTeam/golibs/timeutil"
 )
 
 // allowedTags is the list of available client tags.
@@ -83,6 +89,18 @@ type HostsContainer interface {
 
 // StorageConfig is the client storage configuration structure.
 type StorageConfig struct {
+	// BaseLogger is used to create loggers for other entities.  It should not
+	// have a prefix and must not be nil.
+	BaseLogger *slog.Logger
+
+	// Logger is used for logging the operation of the client storage.  It must
+	// not be nil.
+	Logger *slog.Logger
+
+	// Clock is used by [upstreamManager] to retrieve the current time.  It must
+	// not be nil.
+	Clock timeutil.Clock
+
 	// DHCP is used to match IPs against MACs of persistent clients and update
 	// [SourceDHCP] runtime client information.  It must not be nil.
 	DHCP DHCP
@@ -108,6 +126,10 @@ type StorageConfig struct {
 
 // Storage contains information about persistent and runtime clients.
 type Storage struct {
+	// logger is used for logging the operation of the client storage.  It must
+	// not be nil.
+	logger *slog.Logger
+
 	// mu protects indexes of persistent and runtime clients.
 	mu *sync.Mutex
 
@@ -116,6 +138,9 @@ type Storage struct {
 
 	// runtimeIndex contains information about runtime clients.
 	runtimeIndex *runtimeIndex
+
+	// upstreamManager stores and updates custom client upstream configurations.
+	upstreamManager *upstreamManager
 
 	// dhcp is used to update [SourceDHCP] runtime client information.
 	dhcp DHCP
@@ -145,65 +170,70 @@ type Storage struct {
 }
 
 // NewStorage returns initialized client storage.  conf must not be nil.
-func NewStorage(conf *StorageConfig) (s *Storage, err error) {
+func NewStorage(ctx context.Context, conf *StorageConfig) (s *Storage, err error) {
 	tags := slices.Clone(allowedTags)
 	slices.Sort(tags)
 
 	s = &Storage{
-		allowedTags:            tags,
+		logger:                 conf.Logger,
 		mu:                     &sync.Mutex{},
 		index:                  newIndex(),
 		runtimeIndex:           newRuntimeIndex(),
+		upstreamManager:        newUpstreamManager(conf.BaseLogger, conf.Clock),
 		dhcp:                   conf.DHCP,
 		etcHosts:               conf.EtcHosts,
 		arpDB:                  conf.ARPDB,
 		done:                   make(chan struct{}),
+		allowedTags:            tags,
 		arpClientsUpdatePeriod: conf.ARPClientsUpdatePeriod,
 		runtimeSourceDHCP:      conf.RuntimeSourceDHCP,
 	}
 
 	for i, p := range conf.InitialClients {
-		err = s.Add(p)
+		err = s.Add(ctx, p)
 		if err != nil {
 			return nil, fmt.Errorf("adding client %q at index %d: %w", p.Name, i, err)
 		}
 	}
 
-	s.ReloadARP()
+	s.ReloadARP(ctx)
 
 	return s, nil
 }
 
-// Start starts the goroutines for updating the runtime client information.
-//
-// TODO(s.chzhen):  Pass context.
-func (s *Storage) Start(_ context.Context) (err error) {
-	go s.periodicARPUpdate()
-	go s.handleHostsUpdates()
+// type check
+var _ service.Interface = (*Storage)(nil)
+
+// Start implements the [service.Interface] for *Storage.  It starts the
+// goroutines for updating the runtime client information.
+func (s *Storage) Start(ctx context.Context) (err error) {
+	go s.periodicARPUpdate(ctx)
+	go s.handleHostsUpdates(ctx)
 
 	return nil
 }
 
-// Shutdown gracefully stops the client storage.
+// Shutdown implements the [service.Interface] interface for *Storage.  It
+// gracefully stops the client storage.
 //
-// TODO(s.chzhen):  Pass context.
+// TODO(a.garipov):  Use context.
 func (s *Storage) Shutdown(_ context.Context) (err error) {
 	close(s.done)
 
-	return s.closeUpstreams()
+	return s.upstreamManager.close()
 }
 
 // periodicARPUpdate periodically reloads runtime clients from ARP.  It is
 // intended to be used as a goroutine.
-func (s *Storage) periodicARPUpdate() {
-	defer log.OnPanic("storage")
+func (s *Storage) periodicARPUpdate(ctx context.Context) {
+	defer slogutil.RecoverAndLog(ctx, s.logger)
 
 	t := time.NewTicker(s.arpClientsUpdatePeriod)
 
 	for {
 		select {
 		case <-t.C:
-			s.ReloadARP()
+			s.ReloadARP(ctx)
 		case <-s.done:
 			return
 		}
@@ -211,28 +241,28 @@ func (s *Storage) periodicARPUpdate() {
 }
 
 // ReloadARP reloads runtime clients from ARP, if configured.
-func (s *Storage) ReloadARP() {
+func (s *Storage) ReloadARP(ctx context.Context) {
 	if s.arpDB != nil {
-		s.addFromSystemARP()
+		s.addFromSystemARP(ctx)
 	}
 }
 
 // addFromSystemARP adds the IP-hostname pairings from the output of the arp -a
 // command.
-func (s *Storage) addFromSystemARP() {
+func (s *Storage) addFromSystemARP(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.arpDB.Refresh(); err != nil {
+	if err := s.arpDB.Refresh(ctx); err != nil {
 		s.arpDB = arpdb.Empty{}
-		log.Error("refreshing arp container: %s", err)
+		s.logger.ErrorContext(ctx, "refreshing arp container", slogutil.KeyError, err)
 
 		return
 	}
 
 	ns := s.arpDB.Neighbors()
 	if len(ns) == 0 {
-		log.Debug("refreshing arp container: the update is empty")
+		s.logger.DebugContext(ctx, "refreshing arp container: the update is empty")
 
 		return
 	}
@@ -246,17 +276,22 @@ func (s *Storage) addFromSystemARP() {
 
 	removed := s.runtimeIndex.removeEmpty()
 
-	log.Debug("storage: added %d, removed %d client aliases from arp neighborhood", len(ns), removed)
+	s.logger.DebugContext(
+		ctx,
+		"updating client aliases from arp neighborhood",
+		"added", len(ns),
+		"removed", removed,
+	)
 }
 
 // handleHostsUpdates receives the updates from the hosts container and adds
 // them to the clients storage.  It is intended to be used as a goroutine.
-func (s *Storage) handleHostsUpdates() {
+func (s *Storage) handleHostsUpdates(ctx context.Context) {
 	if s.etcHosts == nil {
 		return
 	}
 
-	defer log.OnPanic("storage")
+	defer slogutil.RecoverAndLog(ctx, s.logger)
 
 	for {
 		select {
@@ -265,7 +300,7 @@ func (s *Storage) handleHostsUpdates() {
 				return
 			}
 
-			s.addFromHostsFile(upd)
+			s.addFromHostsFile(ctx, upd)
 		case <-s.done:
 			return
 		}
@@ -274,7 +309,7 @@ func (s *Storage) handleHostsUpdates() {
 
 // addFromHostsFile fills the client-hostname pairing index from the system's
 // hosts files.
-func (s *Storage) addFromHostsFile(hosts *hostsfile.DefaultStorage) {
+func (s *Storage) addFromHostsFile(ctx context.Context, hosts *hostsfile.DefaultStorage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -294,14 +329,19 @@ func (s *Storage) addFromHostsFile(hosts *hostsfile.DefaultStorage) {
 	})
 
 	removed := s.runtimeIndex.removeEmpty()
-	log.Debug("storage: added %d, removed %d client aliases from system hosts file", added, removed)
+	s.logger.DebugContext(
+		ctx,
+		"updating client aliases from system hosts file",
+		"added", added,
+		"removed", removed,
+	)
 }
 
 // type check
 var _ AddressUpdater = (*Storage)(nil)
 
 // UpdateAddress implements the [AddressUpdater] interface for *Storage
-func (s *Storage) UpdateAddress(ip netip.Addr, host string, info *whois.Info) {
+func (s *Storage) UpdateAddress(ctx context.Context, ip netip.Addr, host string, info *whois.Info) {
 	// Common fast path optimization.
 	if host == "" && info == nil {
 		return
@@ -315,12 +355,12 @@ func (s *Storage) UpdateAddress(ip netip.Addr, host string, info *whois.Info) {
 	}
 
 	if info != nil {
-		s.setWHOISInfo(ip, info)
+		s.setWHOISInfo(ctx, ip, info)
 	}
 }
 
 // UpdateDHCP updates [SourceDHCP] runtime client information.
-func (s *Storage) UpdateDHCP() {
+func (s *Storage) UpdateDHCP(ctx context.Context) {
 	if s.dhcp == nil || !s.runtimeSourceDHCP {
 		return
 	}
@@ -338,14 +378,23 @@ func (s *Storage) UpdateDHCP() {
 	}
 
 	removed := s.runtimeIndex.removeEmpty()
-	log.Debug("storage: added %d, removed %d client aliases from dhcp", added, removed)
+	s.logger.DebugContext(
+		ctx,
+		"updating client aliases from dhcp",
+		"added", added,
+		"removed", removed,
+	)
 }
 
 // setWHOISInfo sets the WHOIS information for a runtime client.
-func (s *Storage) setWHOISInfo(ip netip.Addr, wi *whois.Info) {
+func (s *Storage) setWHOISInfo(ctx context.Context, ip netip.Addr, wi *whois.Info) {
 	_, ok := s.index.findByIP(ip)
 	if ok {
-		log.Debug("storage: client for %s is already created, ignore whois info", ip)
+		s.logger.DebugContext(
+			ctx,
+			"persistent client is already created, ignore whois info",
+			"ip", ip,
+		)
 
 		return
 	}
@@ -358,14 +407,14 @@ func (s *Storage) setWHOISInfo(ip netip.Addr, wi *whois.Info) {
 
 	rc.setWHOIS(wi)
 
-	log.Debug("storage: set whois info for runtime client with ip %s: %+v", ip, wi)
+	s.logger.DebugContext(ctx, "set whois info for runtime client", "ip", ip, "whois", wi)
 }
 
 // Add stores persistent client information or returns an error.
-func (s *Storage) Add(p *Persistent) (err error) {
+func (s *Storage) Add(ctx context.Context, p *Persistent) (err error) {
 	defer func() { err = errors.Annotate(err, "adding client: %w") }()
 
-	err = p.validate(s.allowedTags)
+	err = p.validate(ctx, s.logger, s.allowedTags)
 	if err != nil {
 		// Don't wrap the error since there is already an annotation deferred.
 		return err
@@ -387,47 +436,144 @@ func (s *Storage) Add(p *Persistent) (err error) {
 	}
 
 	s.index.add(p)
+	s.upstreamManager.updateCustomUpstreamConfig(p)
 
-	log.Debug("client storage: added %q: IDs: %q [%d]", p.Name, p.IDs(), s.index.size())
+	s.logger.DebugContext(
+		ctx,
+		"client added",
+		"name", p.Name,
+		"ids", p.Identifiers(),
+		"clients_count", s.index.size(),
+	)
 
 	return nil
 }
 
-// FindByName finds persistent client by name.  And returns its shallow copy.
-func (s *Storage) FindByName(name string) (p *Persistent, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// FindParams represents the parameters for searching a client.  At least one
+// field must be non-empty.
+type FindParams struct {
+	// ClientID is a unique identifier for the client used in DoH, DoT, and DoQ
+	// DNS queries.
+	ClientID ClientID
 
-	p, ok = s.index.findByName(name)
-	if ok {
-		return p.ShallowClone(), ok
-	}
+	// RemoteIP is the IP address used as a client search parameter.
+	RemoteIP netip.Addr
 
-	return nil, false
+	// Subnet is the CIDR used as a client search parameter.
+	Subnet netip.Prefix
+
+	// MAC is the physical hardware address used as a client search parameter.
+	MAC net.HardwareAddr
+
+	// UID is the unique ID of persistent client used as a search parameter.
+	//
+	// TODO(s.chzhen):  Use this.
+	UID UID
 }
 
-// Find finds persistent client by string representation of the client ID, IP
-// address, or MAC.  And returns its shallow copy.
+// ErrBadIdentifier is returned by [FindParams.Set] when it cannot parse the
+// provided client identifier.
+const ErrBadIdentifier errors.Error = "bad client identifier"
+
+// Set clears the stored search parameters and parses the string representation
+// of the search parameter into typed parameter, storing it.  In some cases, it
+// may result in storing both an IP address and a MAC address because they might
+// have identical string representations.  It returns [ErrBadIdentifier] if id
+// cannot be parsed.
 //
-// TODO(s.chzhen):  Accept ClientIDData structure instead, which will contain
-// the parsed IP address, if any.
-func (s *Storage) Find(id string) (p *Persistent, ok bool) {
+// TODO(s.chzhen):  Add support for UID.
+func (p *FindParams) Set(id string) (err error) {
+	*p = FindParams{}
+
+	isFound := false
+
+	if netutil.IsValidIPString(id) {
+		// It is safe to use [netip.MustParseAddr] because it has already been
+		// validated that id contains the string representation of the IP
+		// address.
+		p.RemoteIP = netip.MustParseAddr(id)
+
+		// Even if id can be parsed as an IP address, it may be a MAC address.
+		// So do not return prematurely, continue parsing.
+		isFound = true
+	}
+
+	if netutil.IsValidMACString(id) {
+		p.MAC, err = net.ParseMAC(id)
+		if err != nil {
+			panic(fmt.Errorf("parsing mac from %q: %w", id, err))
+		}
+
+		isFound = true
+	}
+
+	if isFound {
+		return nil
+	}
+
+	if netutil.IsValidIPPrefixString(id) {
+		// It is safe to use [netip.MustParsePrefix] because it has already been
+		// validated that id contains the string representation of IP prefix.
+		p.Subnet = netip.MustParsePrefix(id)
+
+		return nil
+	}
+
+	if !isValidClientID(id) {
+		return ErrBadIdentifier
+	}
+
+	p.ClientID = ClientID(id)
+
+	return nil
+}
+
+// Find represents the parameters for searching a client.  params must not be
+// nil and must have at least one non-empty field.
+func (s *Storage) Find(params *FindParams) (p *Persistent, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	p, ok = s.index.find(id)
+	isClientID := params.ClientID != ""
+	isRemoteIP := params.RemoteIP != (netip.Addr{})
+	isSubnet := params.Subnet != (netip.Prefix{})
+	isMAC := params.MAC != nil
+
+	for {
+		switch {
+		case isClientID:
+			isClientID = false
+			p, ok = s.index.findByClientID(params.ClientID)
+		case isRemoteIP:
+			isRemoteIP = false
+			p, ok = s.findByIP(params.RemoteIP)
+		case isSubnet:
+			isSubnet = false
+			p, ok = s.index.findByCIDR(params.Subnet)
+		case isMAC:
+			isMAC = false
+			p, ok = s.index.findByMAC(params.MAC)
+		default:
+			return nil, false
+		}
+
+		if ok {
+			return p.ShallowClone(), true
+		}
+	}
+}
+
+// findByIP finds persistent client by IP address.  s.mu is expected to be
+// locked.
+func (s *Storage) findByIP(addr netip.Addr) (p *Persistent, ok bool) {
+	p, ok = s.index.findByIP(addr)
 	if ok {
-		return p.ShallowClone(), ok
+		return p, true
 	}
 
-	ip, err := netip.ParseAddr(id)
-	if err != nil {
-		return nil, false
-	}
-
-	foundMAC := s.dhcp.MACByIP(ip)
+	foundMAC := s.dhcp.MACByIP(addr)
 	if foundMAC != nil {
-		return s.FindByMAC(foundMAC)
+		return s.index.findByMAC(foundMAC)
 	}
 
 	return nil, false
@@ -440,6 +586,8 @@ func (s *Storage) Find(id string) (p *Persistent, ok bool) {
 //
 // Note that multiple clients can have the same IP address with different zones.
 // Therefore, the result of this method is indeterminate.
+//
+// TODO(s.chzhen):  Consider accepting [FindParams].
 func (s *Storage) FindLoose(ip netip.Addr, id string) (p *Persistent, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -447,6 +595,11 @@ func (s *Storage) FindLoose(ip netip.Addr, id string) (p *Persistent, ok bool) {
 	p, ok = s.index.find(id)
 	if ok {
 		return p.ShallowClone(), ok
+	}
+
+	foundMAC := s.dhcp.MACByIP(ip)
+	if foundMAC != nil {
+		return s.index.findByMAC(foundMAC)
 	}
 
 	p = s.index.findByIPWithoutZone(ip)
@@ -457,20 +610,9 @@ func (s *Storage) FindLoose(ip netip.Addr, id string) (p *Persistent, ok bool) {
 	return nil, false
 }
 
-// FindByMAC finds persistent client by MAC and returns its shallow copy.  s.mu
-// is expected to be locked.
-func (s *Storage) FindByMAC(mac net.HardwareAddr) (p *Persistent, ok bool) {
-	p, ok = s.index.findByMAC(mac)
-	if ok {
-		return p.ShallowClone(), ok
-	}
-
-	return nil, false
-}
-
 // RemoveByName removes persistent client information.  ok is false if no such
 // client exists by that name.
-func (s *Storage) RemoveByName(name string) (ok bool) {
+func (s *Storage) RemoveByName(ctx context.Context, name string) (ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -479,21 +621,22 @@ func (s *Storage) RemoveByName(name string) (ok bool) {
 		return false
 	}
 
-	if err := p.CloseUpstreams(); err != nil {
-		log.Error("client storage: removing client %q: %s", p.Name, err)
-	}
-
 	s.index.remove(p)
+
+	err := s.upstreamManager.remove(p.UID)
+	if err != nil {
+		s.logger.DebugContext(ctx, "closing client upstreams", "name", name, slogutil.KeyError, err)
+	}
 
 	return true
 }
 
 // Update finds the stored persistent client by its name and updates its
 // information from p.
-func (s *Storage) Update(name string, p *Persistent) (err error) {
+func (s *Storage) Update(ctx context.Context, name string, p *Persistent) (err error) {
 	defer func() { err = errors.Annotate(err, "updating client: %w") }()
 
-	err = p.validate(s.allowedTags)
+	err = p.validate(ctx, s.logger, s.allowedTags)
 	if err != nil {
 		// Don't wrap the error since there is already an annotation deferred.
 		return err
@@ -521,6 +664,8 @@ func (s *Storage) Update(name string, p *Persistent) (err error) {
 	s.index.remove(stored)
 	s.index.add(p)
 
+	s.upstreamManager.updateCustomUpstreamConfig(p)
+
 	return nil
 }
 
@@ -541,14 +686,6 @@ func (s *Storage) Size() (n int) {
 	return s.index.size()
 }
 
-// closeUpstreams closes upstream configurations of persistent clients.
-func (s *Storage) closeUpstreams() (err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.index.closeUpstreams()
-}
-
 // ClientRuntime returns a copy of the saved runtime client by ip.  If no such
 // client exists, returns nil.
 func (s *Storage) ClientRuntime(ip netip.Addr) (rc *Runtime) {
@@ -556,17 +693,21 @@ func (s *Storage) ClientRuntime(ip netip.Addr) (rc *Runtime) {
 	defer s.mu.Unlock()
 
 	rc = s.runtimeIndex.client(ip)
-	if rc != nil {
+	if !s.runtimeSourceDHCP {
 		return rc.clone()
 	}
 
-	if !s.runtimeSourceDHCP {
-		return nil
+	// SourceHostsFile > SourceDHCP, so return immediately if the client is from
+	// the hosts file.
+	if rc != nil && rc.hostsFile != nil {
+		return rc.clone()
 	}
 
+	// Otherwise, check the DHCP server and add the client information if there
+	// is any.
 	host := s.dhcp.HostByIP(ip)
 	if host == "" {
-		return nil
+		return rc.clone()
 	}
 
 	rc = s.runtimeIndex.setInfo(ip, SourceDHCP, []string{host})
@@ -586,4 +727,84 @@ func (s *Storage) RangeRuntime(f func(rc *Runtime) (cont bool)) {
 // modified.
 func (s *Storage) AllowedTags() (tags []string) {
 	return s.allowedTags
+}
+
+// CustomUpstreamConfig implements the [dnsforward.ClientsContainer] interface
+// for *Storage
+func (s *Storage) CustomUpstreamConfig(
+	id string,
+	addr netip.Addr,
+) (prxConf *proxy.CustomUpstreamConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.index.findByClientID(ClientID(id))
+	if !ok {
+		c, ok = s.findByIP(addr)
+	}
+
+	if !ok {
+		return nil
+	}
+
+	return s.upstreamManager.customUpstreamConfig(c.UID, c.Name)
+}
+
+// UpdateCommonUpstreamConfig implements the [dnsforward.ClientsContainer]
+// interface for *Storage
+func (s *Storage) UpdateCommonUpstreamConfig(conf *CommonUpstreamConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.upstreamManager.updateCommonUpstreamConfig(conf)
+}
+
+// ClearUpstreamCache implements the [dnsforward.ClientsContainer] interface for
+// *Storage
+func (s *Storage) ClearUpstreamCache() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.upstreamManager.clearUpstreamCache()
+}
+
+// ApplyClientFiltering retrieves persistent client information using the
+// ClientID or client IP address, and applies it to the filtering settings.
+// setts must not be nil.
+func (s *Storage) ApplyClientFiltering(id string, addr netip.Addr, setts *filtering.Settings) {
+	c, ok := s.index.findByClientID(ClientID(id))
+	if !ok {
+		c, ok = s.index.findByIP(addr)
+	}
+
+	if !ok {
+		foundMAC := s.dhcp.MACByIP(addr)
+		if foundMAC != nil {
+			c, ok = s.index.findByMAC(foundMAC)
+		}
+	}
+
+	if !ok {
+		s.logger.Debug("no client filtering settings found", "clientid", id, "addr", addr)
+
+		return
+	}
+
+	s.logger.Debug("applying custom client filtering settings", "client_name", c.Name)
+
+	if c.UseOwnBlockedServices {
+		setts.BlockedServices = c.BlockedServices.Clone()
+	}
+
+	setts.ClientName = c.Name
+	setts.ClientTags = slices.Clone(c.Tags)
+	if !c.UseOwnSettings {
+		return
+	}
+
+	setts.FilteringEnabled = c.FilteringEnabled
+	setts.SafeSearchEnabled = c.SafeSearchConf.Enabled
+	setts.ClientSafeSearch = c.SafeSearch
+	setts.SafeBrowsingEnabled = c.SafeBrowsingEnabled
+	setts.ParentalEnabled = c.ParentalEnabled
 }

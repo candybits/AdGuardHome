@@ -3,33 +3,50 @@ package home
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/arpdb"
 	"github.com/AdguardTeam/AdGuardHome/internal/client"
-	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
 	"github.com/AdguardTeam/AdGuardHome/internal/querylog"
 	"github.com/AdguardTeam/AdGuardHome/internal/schedule"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
-	"github.com/AdguardTeam/dnsproxy/proxy"
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/stringutil"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/timeutil"
 )
 
 // clientsContainer is the storage of all runtime and persistent clients.
 type clientsContainer struct {
+	// baseLogger is used to create loggers with custom prefixes for safe search
+	// filter.  It must not be nil.
+	baseLogger *slog.Logger
+
+	// logger is used for logging the operation of the client container.  It
+	// must not be nil.
+	logger *slog.Logger
+
 	// storage stores information about persistent clients.
 	storage *client.Storage
 
 	// clientChecker checks if a client is blocked by the current access
 	// settings.
 	clientChecker BlockedClientChecker
+
+	// confModifier is used to update the global configuration.  It must not be
+	// nil.
+	confModifier agh.ConfigModifier
+
+	// httpReg registers HTTP handlers.  It must not be nil.
+	httpReg aghhttp.Registrar
 
 	// lock protects all fields.
 	//
@@ -44,38 +61,49 @@ type clientsContainer struct {
 	// safeSearchCacheTTL is the TTL of the safe search cache to use for
 	// persistent clients.
 	safeSearchCacheTTL time.Duration
-
-	// testing is a flag that disables some features for internal tests.
-	//
-	// TODO(a.garipov): Awful.  Remove.
-	testing bool
 }
 
 // BlockedClientChecker checks if a client is blocked by the current access
 // settings.
 type BlockedClientChecker interface {
+	// TODO(s.chzhen):  Accept [client.FindParams].
 	IsBlockedClient(ip netip.Addr, clientID string) (blocked bool, rule string)
 }
 
-// Init initializes clients container
-// dhcpServer: optional
-// Note: this function must be called only once
+// Init initializes the clients container.  All arguments must not be nil except
+// for objects.
+//
+// NOTE:  This function must be called only once.
+//
+// TODO(s.chzhen):  Use a configuration structure.
 func (clients *clientsContainer) Init(
+	ctx context.Context,
+	baseLogger *slog.Logger,
 	objects []*clientObject,
 	dhcpServer client.DHCP,
 	etcHosts *aghnet.HostsContainer,
 	arpDB arpdb.Interface,
 	filteringConf *filtering.Config,
+	sigHdlr *signalHandler,
+	confModifier agh.ConfigModifier,
+	httpReg aghhttp.Registrar,
 ) (err error) {
 	// TODO(s.chzhen):  Refactor it.
 	if clients.storage != nil {
 		return errors.Error("clients container already initialized")
 	}
 
+	clients.baseLogger = baseLogger
+	clients.logger = baseLogger.With(slogutil.KeyPrefix, "client_container")
+	clients.safeSearchCacheSize = filteringConf.SafeSearchCacheSize
+	clients.safeSearchCacheTTL = time.Minute * time.Duration(filteringConf.CacheTime)
+	clients.confModifier = confModifier
+	clients.httpReg = httpReg
+
 	confClients := make([]*client.Persistent, 0, len(objects))
 	for i, o := range objects {
 		var p *client.Persistent
-		p, err = o.toPersistent(filteringConf)
+		p, err = o.toPersistent(ctx, baseLogger, clients.safeSearchCacheSize, clients.safeSearchCacheTTL)
 		if err != nil {
 			return fmt.Errorf("init persistent client at index %d: %w", i, err)
 		}
@@ -89,12 +117,15 @@ func (clients *clientsContainer) Init(
 	// TODO(e.burkov):  The option should probably be returned, since hosts file
 	// currently used not only for clients' information enrichment, but also in
 	// the filtering module and upstream addresses resolution.
-	var hosts client.HostsContainer = etcHosts
-	if !config.Clients.Sources.HostsFile {
-		hosts = nil
+	var hosts client.HostsContainer
+	if config.Clients.Sources.HostsFile && etcHosts != nil {
+		hosts = etcHosts
 	}
 
-	clients.storage, err = client.NewStorage(&client.StorageConfig{
+	clients.storage, err = client.NewStorage(ctx, &client.StorageConfig{
+		BaseLogger:             baseLogger,
+		Logger:                 baseLogger.With(slogutil.KeyPrefix, "client_storage"),
+		Clock:                  timeutil.SystemClock{},
 		InitialClients:         confClients,
 		DHCP:                   dhcpServer,
 		EtcHosts:               hosts,
@@ -105,6 +136,10 @@ func (clients *clientsContainer) Init(
 	if err != nil {
 		return fmt.Errorf("init client storage: %w", err)
 	}
+
+	sigHdlr.addClientStorage(clients.storage)
+
+	filteringConf.ApplyClientFiltering = clients.storage.ApplyClientFiltering
 
 	return nil
 }
@@ -117,10 +152,6 @@ var webHandlersRegistered = false
 
 // Start starts the clients container.
 func (clients *clientsContainer) Start(ctx context.Context) (err error) {
-	if clients.testing {
-		return
-	}
-
 	if !webHandlersRegistered {
 		webHandlersRegistered = true
 		clients.registerWebHandlers()
@@ -165,7 +196,10 @@ type clientObject struct {
 
 // toPersistent returns an initialized persistent client if there are no errors.
 func (o *clientObject) toPersistent(
-	filteringConf *filtering.Config,
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	safeSearchCacheSize uint,
+	safeSearchCacheTTL time.Duration,
 ) (cli *client.Persistent, err error) {
 	cli = &client.Persistent{
 		Name: o.Name,
@@ -199,14 +233,23 @@ func (o *clientObject) toPersistent(
 	}
 
 	if o.SafeSearchConf.Enabled {
-		err = cli.SetSafeSearch(
-			o.SafeSearchConf,
-			filteringConf.SafeSearchCacheSize,
-			time.Minute*time.Duration(filteringConf.CacheTime),
+		logger := baseLogger.With(
+			slogutil.KeyPrefix, safesearch.LogPrefix,
+			safesearch.LogKeyClient, cli.Name,
 		)
+		var ss *safesearch.Default
+		ss, err = safesearch.NewDefault(ctx, &safesearch.DefaultConfig{
+			Logger:         logger,
+			ServicesConfig: o.SafeSearchConf,
+			ClientName:     cli.Name,
+			CacheSize:      safeSearchCacheSize,
+			CacheTTL:       safeSearchCacheTTL,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("init safesearch %q: %w", cli.Name, err)
 		}
+
+		cli.SafeSearch = ss
 	}
 
 	if o.BlockedServices == nil {
@@ -215,6 +258,7 @@ func (o *clientObject) toPersistent(
 		}
 	}
 
+	o.BlockedServices.FilterUnknownIDs(ctx, baseLogger)
 	err = o.BlockedServices.Validate()
 	if err != nil {
 		return nil, fmt.Errorf("init blocked services %q: %w", cli.Name, err)
@@ -240,7 +284,7 @@ func (clients *clientsContainer) forConfig() (objs []*clientObject) {
 
 			BlockedServices: cli.BlockedServices.Clone(),
 
-			IDs:       cli.IDs(),
+			IDs:       cli.Identifiers(),
 			Tags:      slices.Clone(cli.Tags),
 			Upstreams: slices.Clone(cli.Upstreams),
 
@@ -327,15 +371,27 @@ func (clients *clientsContainer) clientOrArtificial(
 	}, true
 }
 
-// shouldCountClient is a wrapper around [clientsContainer.find] to make it a
+// shouldCountClient is a wrapper around [client.Storage.Find] to make it a
 // valid client information finder for the statistics.  If no information about
-// the client is found, it returns true.
+// the client is found, it returns true.  Values of ids must be either a valid
+// ClientID or a valid IP address.
+//
+// TODO(s.chzhen):  Accept [client.FindParams].
 func (clients *clientsContainer) shouldCountClient(ids []string) (y bool) {
 	clients.lock.Lock()
 	defer clients.lock.Unlock()
 
+	params := &client.FindParams{}
 	for _, id := range ids {
-		client, ok := clients.storage.Find(id)
+		err := params.Set(id)
+		if err != nil {
+			// Should not happen.
+			clients.logger.Warn("parsing find params", slogutil.KeyError, err)
+
+			continue
+		}
+
+		client, ok := clients.storage.Find(params)
 		if ok {
 			return !client.IgnoreStatistics
 		}
@@ -345,63 +401,17 @@ func (clients *clientsContainer) shouldCountClient(ids []string) (y bool) {
 }
 
 // type check
-var _ dnsforward.ClientsContainer = (*clientsContainer)(nil)
-
-// UpstreamConfigByID implements the [dnsforward.ClientsContainer] interface for
-// *clientsContainer.  upsConf is nil if the client isn't found or if the client
-// has no custom upstreams.
-func (clients *clientsContainer) UpstreamConfigByID(
-	id string,
-	bootstrap upstream.Resolver,
-) (conf *proxy.CustomUpstreamConfig, err error) {
-	clients.lock.Lock()
-	defer clients.lock.Unlock()
-
-	c, ok := clients.storage.Find(id)
-	if !ok {
-		return nil, nil
-	} else if c.UpstreamConfig != nil {
-		return c.UpstreamConfig, nil
-	}
-
-	upstreams := stringutil.FilterOut(c.Upstreams, dnsforward.IsCommentOrEmpty)
-	if len(upstreams) == 0 {
-		return nil, nil
-	}
-
-	var upsConf *proxy.UpstreamConfig
-	upsConf, err = proxy.ParseUpstreamsConfig(
-		upstreams,
-		&upstream.Options{
-			Bootstrap:    bootstrap,
-			Timeout:      config.DNS.UpstreamTimeout.Duration,
-			HTTPVersions: dnsforward.UpstreamHTTPVersions(config.DNS.UseHTTP3Upstreams),
-			PreferIPv6:   config.DNS.BootstrapPreferIPv6,
-		},
-	)
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return nil, err
-	}
-
-	conf = proxy.NewCustomUpstreamConfig(
-		upsConf,
-		c.UpstreamsCacheEnabled,
-		int(c.UpstreamsCacheSize),
-		config.DNS.EDNSClientSubnet.Enabled,
-	)
-	c.UpstreamConfig = conf
-
-	return conf, nil
-}
-
-// type check
 var _ client.AddressUpdater = (*clientsContainer)(nil)
 
 // UpdateAddress implements the [client.AddressUpdater] interface for
 // *clientsContainer
-func (clients *clientsContainer) UpdateAddress(ip netip.Addr, host string, info *whois.Info) {
-	clients.storage.UpdateAddress(ip, host, info)
+func (clients *clientsContainer) UpdateAddress(
+	ctx context.Context,
+	ip netip.Addr,
+	host string,
+	info *whois.Info,
+) {
+	clients.storage.UpdateAddress(ctx, ip, host, info)
 }
 
 // close gracefully closes all the client-specific upstream configurations of

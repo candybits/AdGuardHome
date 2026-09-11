@@ -1,7 +1,7 @@
 import React from 'react';
 import { Trans, withTranslation } from 'react-i18next';
 
-import Guide from '../ui/Guide';
+import { Guide } from '../ui/Guide';
 
 import Card from '../ui/Card';
 
@@ -14,10 +14,7 @@ interface SetupGuideProps {
     t: (id: string) => string;
 }
 
-const SetupGuide = ({
-    t,
-    dashboard: { dnsAddresses },
-}: SetupGuideProps) => (
+const SetupGuide = ({ t, dashboard: { dnsAddresses } }: SetupGuideProps) => (
     <div className="guide">
         <PageTitle title={t('setup_guide')} />
 
@@ -33,13 +30,13 @@ const SetupGuide = ({
                     <Trans>install_devices_address</Trans>:
                 </div>
 
-                <div className="mt-3">
+                <ul className="guide__list">
                     {dnsAddresses.map((ip: any) => (
                         <li key={ip} className="guide__address">
                             {ip}
                         </li>
                     ))}
-                </div>
+                </ul>
             </div>
 
             <Guide dnsAddresses={dnsAddresses} />

@@ -5,14 +5,15 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"go.etcd.io/bbolt"
-	"golang.org/x/exp/maps"
 )
 
 const (
@@ -62,8 +63,9 @@ type Entry struct {
 	// Domain is the domain name requested.
 	Domain string
 
-	// Upstream is the upstream DNS server.
-	Upstream string
+	// UpstreamStats contains the DNS query statistics for both the upstream and
+	// fallback DNS servers.  Don't modify items in the slice.
+	UpstreamStats []*proxy.UpstreamStatistics
 
 	// Result is the result of processing the request.
 	Result Result
@@ -71,9 +73,6 @@ type Entry struct {
 	// ProcessingTime is the duration of the request processing from the start
 	// of the request including timeouts.
 	ProcessingTime time.Duration
-
-	// UpstreamTime is the duration of the successful request to the upstream.
-	UpstreamTime time.Duration
 }
 
 // validate returns an error if entry is not valid.
@@ -234,18 +233,15 @@ func (a countPair) compareCount(b countPair) (res int) {
 	}
 }
 
-func convertMapToSlice(m map[string]uint64, max int) (s []countPair) {
+func convertMapToSlice(m map[string]uint64, maxVal int) (s []countPair) {
 	s = make([]countPair, 0, len(m))
 	for k, v := range m {
 		s = append(s, countPair{Name: k, Count: v})
 	}
 
 	slices.SortFunc(s, countPair.compareCount)
-	if max > len(s) {
-		max = len(s)
-	}
 
-	return s[:max]
+	return s[:min(maxVal, len(s))]
 }
 
 func convertSliceToMap(a []countPair) (m map[string]uint64) {
@@ -332,10 +328,14 @@ func (u *unit) add(e *Entry) {
 	u.timeSum += pt
 	u.nTotal++
 
-	if e.Upstream != "" {
-		u.upstreamsResponses[e.Upstream]++
-		ut := uint64(e.UpstreamTime.Microseconds())
-		u.upstreamsTimeSum[e.Upstream] += ut
+	for _, s := range e.UpstreamStats {
+		if s.IsCached || s.Error != nil {
+			continue
+		}
+
+		addr := s.Address
+		u.upstreamsResponses[addr]++
+		u.upstreamsTimeSum[addr] += uint64(s.QueryDuration.Microseconds())
 	}
 }
 
@@ -611,9 +611,7 @@ func microsecondsToSeconds(n float64) (r float64) {
 func prepareTopUpstreamsAvgTime(
 	upstreamsAvgTime topAddrsFloat,
 ) (topUpstreamsAvgTime []topAddrsFloat) {
-	keys := maps.Keys(upstreamsAvgTime)
-
-	slices.SortFunc(keys, func(a, b string) (res int) {
+	keys := slices.SortedStableFunc(maps.Keys(upstreamsAvgTime), func(a, b string) (res int) {
 		switch x, y := upstreamsAvgTime[a], upstreamsAvgTime[b]; {
 		case x > y:
 			return -1

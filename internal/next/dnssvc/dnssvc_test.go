@@ -6,15 +6,13 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/next/dnssvc"
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
 
 // testTimeout is the common timeout for tests.
 const testTimeout = 1 * time.Second
@@ -26,14 +24,13 @@ func TestService(t *testing.T) {
 		upstreamAddr  = "upstream.example"
 	)
 
+	pt := testutil.NewPanicT(t)
 	upstreamErrCh := make(chan error, 1)
 	upstreamStartedCh := make(chan struct{})
 	upstreamSrv := &dns.Server{
 		Addr: bootstrapAddr,
 		Net:  "udp",
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
-			pt := testutil.PanicT{}
-
 			resp := (&dns.Msg{}).SetReply(req)
 			resp.Answer = append(resp.Answer, &dns.A{
 				Hdr: dns.RR_Header{},
@@ -59,19 +56,18 @@ func TestService(t *testing.T) {
 	_, _ = testutil.RequireReceive(t, upstreamStartedCh, testTimeout)
 
 	c := &dnssvc.Config{
-		Addresses:           []netip.AddrPort{netip.MustParseAddrPort(listenAddr)},
-		BootstrapServers:    []string{upstreamSrv.PacketConn.LocalAddr().String()},
-		UpstreamServers:     []string{upstreamAddr},
-		DNS64Prefixes:       nil,
-		UpstreamTimeout:     testTimeout,
-		BootstrapPreferIPv6: false,
-		UseDNS64:            false,
+		Logger:           slogutil.NewDiscardLogger(),
+		UpstreamMode:     proxy.UpstreamModeParallel,
+		Addresses:        []netip.AddrPort{netip.MustParseAddrPort(listenAddr)},
+		BootstrapServers: []string{upstreamSrv.PacketConn.LocalAddr().String()},
+		UpstreamServers:  []string{upstreamAddr},
+		UpstreamTimeout:  testTimeout,
 	}
 
 	svc, err := dnssvc.New(c)
 	require.NoError(t, err)
 
-	err = svc.Start()
+	err = svc.Start(testutil.ContextWithTimeout(t, testTimeout))
 	require.NoError(t, err)
 
 	gotConf := svc.Config()

@@ -1,14 +1,14 @@
 package configmgr
 
 import (
-	"fmt"
 	"net/netip"
 
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/timeutil"
+	"github.com/AdguardTeam/golibs/validate"
 )
-
-// Configuration Structures
 
 // config is the top-level on-disk configuration structure.
 type config struct {
@@ -19,70 +19,72 @@ type config struct {
 	SchemaVersion int `yaml:"schema_version"`
 }
 
-const errNoConf errors.Error = "configuration not found"
+// type check
+var _ validate.Interface = (*config)(nil)
 
-// validate returns an error if the configuration structure is invalid.
-func (c *config) validate() (err error) {
+// Validate implements the [validate.Interface] interface for *config.
+func (c *config) Validate() (err error) {
 	if c == nil {
-		return errNoConf
+		return errors.ErrNoValue
 	}
 
 	// TODO(a.garipov): Add more validations.
 
 	// Keep this in the same order as the fields in the config.
-	validators := []struct {
-		validate func() (err error)
-		name     string
-	}{{
-		validate: c.DNS.validate,
-		name:     "dns",
+	validators := container.KeyValues[string, validate.Interface]{{
+		Key:   "dns",
+		Value: c.DNS,
 	}, {
-		validate: c.HTTP.validate,
-		name:     "http",
+		Key:   "http",
+		Value: c.HTTP,
 	}, {
-		validate: c.Log.validate,
-		name:     "log",
+		Key:   "log",
+		Value: c.Log,
 	}}
 
-	for _, v := range validators {
-		err = v.validate()
-		if err != nil {
-			return fmt.Errorf("%s: %w", v.name, err)
-		}
+	var errs []error
+	for _, kv := range validators {
+		errs = validate.Append(errs, kv.Key, kv.Value)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // dnsConfig is the on-disk DNS configuration.
 type dnsConfig struct {
-	Addresses           []netip.AddrPort  `yaml:"addresses"`
-	BootstrapDNS        []string          `yaml:"bootstrap_dns"`
-	UpstreamDNS         []string          `yaml:"upstream_dns"`
-	DNS64Prefixes       []netip.Prefix    `yaml:"dns64_prefixes"`
-	UpstreamTimeout     timeutil.Duration `yaml:"upstream_timeout"`
-	BootstrapPreferIPv6 bool              `yaml:"bootstrap_prefer_ipv6"`
-	UseDNS64            bool              `yaml:"use_dns64"`
+	UpstreamMode        proxy.UpstreamMode `yaml:"upstream_mode"`
+	Addresses           []netip.AddrPort   `yaml:"addresses"`
+	BootstrapDNS        []string           `yaml:"bootstrap_dns"`
+	UpstreamDNS         []string           `yaml:"upstream_dns"`
+	DNS64Prefixes       []netip.Prefix     `yaml:"dns64_prefixes"`
+	UpstreamTimeout     timeutil.Duration  `yaml:"upstream_timeout"`
+	Ratelimit           int                `yaml:"ratelimit"`
+	CacheSize           int                `yaml:"cache_size"`
+	BootstrapPreferIPv6 bool               `yaml:"bootstrap_prefer_ipv6"`
+	RefuseAny           bool               `yaml:"refuse_any"`
+	UseDNS64            bool               `yaml:"use_dns64"`
 }
 
-// validate returns an error if the DNS configuration structure is invalid.
+// type check
+var _ validate.Interface = (*dnsConfig)(nil)
+
+// Validate implements the [validate.Interface] interface for *dnsConfig.
 //
 // TODO(a.garipov): Add more validations.
-func (c *dnsConfig) validate() (err error) {
-	// TODO(a.garipov): Add more validations.
-	switch {
-	case c == nil:
-		return errNoConf
-	case c.UpstreamTimeout.Duration <= 0:
-		return newMustBePositiveError("upstream_timeout", c.UpstreamTimeout)
-	default:
-		return nil
+func (c *dnsConfig) Validate() (err error) {
+	if c == nil {
+		return errors.ErrNoValue
 	}
+
+	// TODO(a.garipov): Add more validations.
+
+	return validate.Positive("upstream_timeout", c.UpstreamTimeout)
 }
 
 // httpConfig is the on-disk web API configuration.
 type httpConfig struct {
 	Pprof *httpPprofConfig `yaml:"pprof"`
+	DoH   *doHConfig       `yaml:"doh"`
 
 	// TODO(a.garipov): Document the configuration change.
 	Addresses       []netip.AddrPort  `yaml:"addresses"`
@@ -91,18 +93,24 @@ type httpConfig struct {
 	ForceHTTPS      bool              `yaml:"force_https"`
 }
 
-// validate returns an error if the HTTP configuration structure is invalid.
+// type check
+var _ validate.Interface = (*httpConfig)(nil)
+
+// Validate implements the [validate.Interface] interface for *httpConfig.
 //
 // TODO(a.garipov): Add more validations.
-func (c *httpConfig) validate() (err error) {
-	switch {
-	case c == nil:
-		return errNoConf
-	case c.Timeout.Duration <= 0:
-		return newMustBePositiveError("timeout", c.Timeout)
-	default:
-		return c.Pprof.validate()
+func (c *httpConfig) Validate() (err error) {
+	if c == nil {
+		return errors.ErrNoValue
 	}
+
+	errs := []error{
+		validate.Positive("timeout", c.Timeout),
+	}
+
+	errs = validate.Append(errs, "pprof", c.Pprof)
+
+	return errors.Join(errs...)
 }
 
 // httpPprofConfig is the on-disk pprof configuration.
@@ -111,27 +119,48 @@ type httpPprofConfig struct {
 	Enabled bool   `yaml:"enabled"`
 }
 
-// validate returns an error if the pprof configuration structure is invalid.
-func (c *httpPprofConfig) validate() (err error) {
+// type check
+var _ validate.Interface = (*httpPprofConfig)(nil)
+
+// Validate implements the [validate.Interface] interface for *httpPprofConfig.
+func (c *httpPprofConfig) Validate() (err error) {
 	if c == nil {
-		return errNoConf
+		return errors.ErrNoValue
 	}
 
 	return nil
 }
 
+// doHConfig is the block with DNS-over-HTTPS configuration.
+type doHConfig struct {
+	// Routes is the list of HTTP route patterns for DoH requests.  Each route
+	// should be in the format "METHOD /path" or "METHOD /path/{param}".
+	// Default routes are:
+	//   - "GET /dns-query"
+	//   - "POST /dns-query"
+	//   - "GET /dns-query/{ClientID}"
+	//   - "POST /dns-query/{ClientID}"
+	Routes []string `yaml:"routes"`
+
+	// InsecureEnabled allows DoH queries via unencrypted HTTP.
+	InsecureEnabled bool `yaml:"insecure_enabled"`
+}
+
 // logConfig is the on-disk web API configuration.
 type logConfig struct {
-	// TODO(a.garipov): Use.
+	// TODO(a.garipov):  Use.
 	Verbose bool `yaml:"verbose"`
 }
 
-// validate returns an error if the HTTP configuration structure is invalid.
+// type check
+var _ validate.Interface = (*logConfig)(nil)
+
+// Validate implements the [validate.Interface] interface for *logConfig.
 //
 // TODO(a.garipov): Add more validations.
-func (c *logConfig) validate() (err error) {
+func (c *logConfig) Validate() (err error) {
 	if c == nil {
-		return errNoConf
+		return errors.ErrNoValue
 	}
 
 	return nil

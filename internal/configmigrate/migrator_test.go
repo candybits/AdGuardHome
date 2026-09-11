@@ -1,21 +1,20 @@
 package configmigrate_test
 
 import (
+	"bytes"
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/configmigrate"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/require"
+	yaml "go.yaml.in/yaml/v4"
 	"golang.org/x/crypto/bcrypt"
-	yaml "gopkg.in/yaml.v3"
 )
-
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
 
 // testdata is a virtual filesystem containing test data.
 var testdata = os.DirFS("testdata")
@@ -51,6 +50,8 @@ func getField[T any](t require.TestingT, obj any, indexes ...any) (val T) {
 }
 
 func TestMigrateConfig_Migrate(t *testing.T) {
+	t.Parallel()
+
 	const (
 		inputFileName  = "input.yml"
 		outputFileName = "output.yml"
@@ -190,10 +191,36 @@ func TestMigrateConfig_Migrate(t *testing.T) {
 		yamlEqFunc:    require.YAMLEq,
 		name:          "v27",
 		targetVersion: 27,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v28",
+		targetVersion: 28,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v30",
+		targetVersion: 30,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v31",
+		targetVersion: 31,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v32",
+		targetVersion: 32,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v33",
+		targetVersion: 33,
+	}, {
+		yamlEqFunc:    require.YAMLEq,
+		name:          "v34",
+		targetVersion: 34,
 	}}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			body, err := fs.ReadFile(testdata, path.Join(t.Name(), inputFileName))
 			require.NoError(t, err)
 
@@ -201,13 +228,60 @@ func TestMigrateConfig_Migrate(t *testing.T) {
 			require.NoError(t, err)
 
 			migrator := configmigrate.New(&configmigrate.Config{
+				Logger:     testLogger,
 				WorkingDir: t.Name(),
+				DataDir:    filepath.Join(t.Name(), "data"),
 			})
-			newBody, upgraded, err := migrator.Migrate(body, tc.targetVersion)
+			ctx := testutil.ContextWithTimeout(t, testTimeout)
+			newBody, upgraded, err := migrator.Migrate(ctx, body, tc.targetVersion)
 			require.NoError(t, err)
 			require.True(t, upgraded)
 
 			tc.yamlEqFunc(t, string(wantBody), string(newBody))
 		})
 	}
+}
+
+// TODO(a.garipov):  Consider ways of merging into the previous one.
+func TestMigrateConfig_Migrate_v29(t *testing.T) {
+	t.Parallel()
+
+	const (
+		pathUnix       = `/path/to/file.txt`
+		userDirPatUnix = `TestMigrateConfig_Migrate/v29/data/userfilters/*`
+
+		pathWindows       = `C:\path\to\file.txt`
+		userDirPatWindows = `TestMigrateConfig_Migrate\v29\data\userfilters\*`
+	)
+
+	pathToReplace := pathUnix
+	patternToReplace := userDirPatUnix
+	if runtime.GOOS == "windows" {
+		pathToReplace = pathWindows
+		patternToReplace = userDirPatWindows
+	}
+
+	body, err := fs.ReadFile(testdata, "TestMigrateConfig_Migrate/v29/input.yml")
+	require.NoError(t, err)
+
+	body = bytes.ReplaceAll(body, []byte("FILEPATH"), []byte(pathToReplace))
+
+	wantBody, err := fs.ReadFile(testdata, "TestMigrateConfig_Migrate/v29/output.yml")
+	require.NoError(t, err)
+
+	wantBody = bytes.ReplaceAll(wantBody, []byte("FILEPATH"), []byte(pathToReplace))
+	wantBody = bytes.ReplaceAll(wantBody, []byte("USERFILTERSPATH"), []byte(patternToReplace))
+
+	migrator := configmigrate.New(&configmigrate.Config{
+		Logger:     testLogger,
+		WorkingDir: t.Name(),
+		DataDir:    "TestMigrateConfig_Migrate/v29/data",
+	})
+
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	newBody, upgraded, err := migrator.Migrate(ctx, body, 29)
+	require.NoError(t, err)
+	require.True(t, upgraded)
+
+	require.YAMLEq(t, string(wantBody), string(newBody))
 }

@@ -12,11 +12,15 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/next/configmgr"
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/service"
 )
 
 // Main is the entry point of AdGuard Home.
 func Main(embeddedFrontend fs.FS) {
+	ctx := context.Background()
+
 	start := time.Now()
 
 	cmdName := os.Args[0]
@@ -26,70 +30,59 @@ func Main(embeddedFrontend fs.FS) {
 		os.Exit(exitCode)
 	}
 
-	err = setLog(opts)
-	check(err)
+	baseLogger := newBaseLogger(opts)
 
-	log.Info("starting adguard home, version %s, pid %d", version.Version(), os.Getpid())
-
-	if opts.workDir != "" {
-		log.Info("changing working directory to %q", opts.workDir)
-		err = os.Chdir(opts.workDir)
-		check(err)
-	}
-
-	frontend, err := frontendFromOpts(opts, embeddedFrontend)
-	check(err)
-
-	confMgrConf := &configmgr.Config{
-		Frontend: frontend,
-		WebAddr:  opts.webAddr,
-		Start:    start,
-		FileName: opts.confFile,
-	}
-
-	confMgr, err := newConfigMgr(confMgrConf)
-	check(err)
-
-	web := confMgr.Web()
-	err = web.Start()
-	check(err)
-
-	dns := confMgr.DNS()
-	err = dns.Start()
-	check(err)
-
-	sigHdlr := newSignalHandler(
-		confMgrConf,
-		opts.pidFile,
-		web,
-		dns,
+	baseLogger.InfoContext(
+		ctx,
+		"starting adguard home",
+		"version", version.Version(),
+		"pid", os.Getpid(),
 	)
 
-	sigHdlr.handle()
-}
+	if opts.workDir != "" {
+		baseLogger.InfoContext(ctx, "changing working directory", "dir", opts.workDir)
 
-// defaultTimeout is the timeout used for some operations where another timeout
-// hasn't been defined yet.
-const defaultTimeout = 5 * time.Second
-
-// ctxWithDefaultTimeout is a helper function that returns a context with
-// timeout set to defaultTimeout.
-func ctxWithDefaultTimeout() (ctx context.Context, cancel context.CancelFunc) {
-	return context.WithTimeout(context.Background(), defaultTimeout)
-}
-
-// newConfigMgr returns a new configuration manager using defaultTimeout as the
-// context timeout.
-func newConfigMgr(c *configmgr.Config) (m *configmgr.Manager, err error) {
-	ctx, cancel := ctxWithDefaultTimeout()
-	defer cancel()
-
-	return configmgr.New(ctx, c)
-}
-
-// check is a simple error-checking helper.  It must only be used within Main.
-func check(err error) {
-	if err != nil {
-		panic(err)
+		err = os.Chdir(opts.workDir)
+		errors.Check(err)
 	}
+
+	frontend, err := frontendFromOpts(ctx, baseLogger, opts, embeddedFrontend)
+	errors.Check(err)
+
+	startCtx, startCancel := context.WithTimeout(ctx, defaultTimeoutStart)
+	defer startCancel()
+
+	confMgrConf := &configmgr.Config{
+		BaseLogger: baseLogger,
+		Logger:     baseLogger.With(slogutil.KeyPrefix, "configmgr"),
+		Frontend:   frontend,
+		WebAddr:    opts.webAddr,
+		Start:      start,
+		FileName:   opts.confFile,
+	}
+
+	svc, err := newServiceMgr(ctx, &serviceMgrConfig{
+		confMgrConf: confMgrConf,
+		logger:      baseLogger.With(slogutil.KeyPrefix, "svc"),
+		pidFilePath: opts.pidFile,
+	})
+	errors.Check(err)
+
+	errors.Check(svc.Start(startCtx))
+
+	sigHdlr := service.NewSignalHandler(&service.SignalHandlerConfig{
+		Logger: baseLogger.With(slogutil.KeyPrefix, service.SignalHandlerPrefix),
+	})
+
+	sigHdlr.AddService(svc)
+	sigHdlr.AddRefresher(svc)
+
+	os.Exit(sigHdlr.Handle(ctx))
 }
+
+// Default timeouts.
+//
+// TODO(a.garipov):  Make configurable.
+const (
+	defaultTimeoutStart = 1 * time.Minute
+)

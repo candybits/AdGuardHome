@@ -26,7 +26,8 @@ func TestEmptyAddrProc(t *testing.T) {
 	p := client.EmptyAddrProc{}
 
 	assert.NotPanics(t, func() {
-		p.Process(testIP)
+		ctx := testutil.ContextWithTimeout(t, testTimeout)
+		p.Process(ctx, testIP)
 	})
 
 	assert.NotPanics(t, func() {
@@ -98,16 +99,24 @@ func TestDefaultAddrProc_Process_rDNS(t *testing.T) {
 			updIPCh := make(chan netip.Addr, 1)
 			updHostCh := make(chan string, 1)
 			updInfoCh := make(chan *whois.Info, 1)
+			onExchange := func(
+				_ context.Context,
+				ip netip.Addr,
+			) (host string, ttl time.Duration, err error) {
+				return tc.host, 0, tc.rdnsErr
+			}
 
 			p := client.NewDefaultAddrProc(&client.DefaultAddrProcConfig{
 				BaseLogger: slogutil.NewDiscardLogger(),
-				DialContext: func(_ context.Context, _, _ string) (conn net.Conn, err error) {
-					panic("not implemented")
+				DialContext: func(
+					ctx context.Context,
+					network,
+					addr string,
+				) (conn net.Conn, err error) {
+					panic(testutil.UnexpectedCall(ctx, network, addr))
 				},
 				Exchanger: &aghtest.Exchanger{
-					OnExchange: func(ip netip.Addr) (host string, ttl time.Duration, err error) {
-						return tc.host, 0, tc.rdnsErr
-					},
+					OnExchange: onExchange,
 				},
 				PrivateSubnets: netutil.SubnetSetFunc(netutil.IsLocallyServed),
 				AddressUpdater: &aghtest.AddressUpdater{
@@ -120,7 +129,8 @@ func TestDefaultAddrProc_Process_rDNS(t *testing.T) {
 			})
 			testutil.CleanupAndRequireSuccess(t, p.Close)
 
-			p.Process(tc.ip)
+			ctx := testutil.ContextWithTimeout(t, testTimeout)
+			p.Process(ctx, tc.ip)
 
 			if !tc.wantUpd {
 				return
@@ -146,8 +156,8 @@ func newOnUpdateAddress(
 	ips chan<- netip.Addr,
 	hosts chan<- string,
 	infos chan<- *whois.Info,
-) (f func(ip netip.Addr, host string, info *whois.Info)) {
-	return func(ip netip.Addr, host string, info *whois.Info) {
+) (f func(ctx context.Context, ip netip.Addr, host string, info *whois.Info)) {
+	return func(ctx context.Context, ip netip.Addr, host string, info *whois.Info) {
 		if !want && (host != "" || info != nil) {
 			panic(fmt.Errorf("got unexpected update for %v with %q and %v", ip, host, info))
 		}
@@ -209,15 +219,20 @@ func TestDefaultAddrProc_Process_WHOIS(t *testing.T) {
 			updHostCh := make(chan string, 1)
 			updInfoCh := make(chan *whois.Info, 1)
 
+			onExchange := func(
+				ctx context.Context,
+				addr netip.Addr,
+			) (_ string, _ time.Duration, _ error) {
+				panic(testutil.UnexpectedCall(ctx, addr))
+			}
+
 			p := client.NewDefaultAddrProc(&client.DefaultAddrProcConfig{
 				BaseLogger: slogutil.NewDiscardLogger(),
 				DialContext: func(_ context.Context, _, _ string) (conn net.Conn, err error) {
 					return whoisConn, nil
 				},
 				Exchanger: &aghtest.Exchanger{
-					OnExchange: func(_ netip.Addr) (_ string, _ time.Duration, _ error) {
-						panic("not implemented")
-					},
+					OnExchange: onExchange,
 				},
 				PrivateSubnets: netutil.SubnetSetFunc(netutil.IsLocallyServed),
 				AddressUpdater: &aghtest.AddressUpdater{
@@ -230,7 +245,8 @@ func TestDefaultAddrProc_Process_WHOIS(t *testing.T) {
 			})
 			testutil.CleanupAndRequireSuccess(t, p.Close)
 
-			p.Process(testIP)
+			ctx := testutil.ContextWithTimeout(t, testTimeout)
+			p.Process(ctx, testIP)
 
 			if !tc.wantUpd {
 				return
@@ -251,7 +267,9 @@ func TestDefaultAddrProc_Process_WHOIS(t *testing.T) {
 func TestDefaultAddrProc_Close(t *testing.T) {
 	t.Parallel()
 
-	p := client.NewDefaultAddrProc(&client.DefaultAddrProcConfig{})
+	p := client.NewDefaultAddrProc(&client.DefaultAddrProcConfig{
+		BaseLogger: slogutil.NewDiscardLogger(),
+	})
 
 	err := p.Close()
 	assert.NoError(t, err)

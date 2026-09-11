@@ -12,6 +12,8 @@ import (
 )
 
 func TestNewTextEngine(t *testing.T) {
+	t.Parallel()
+
 	eng, err := rulelist.NewTextEngine(&rulelist.TextEngineConfig{
 		Name: "RulesEngine",
 		Rules: []string{
@@ -36,5 +38,5 @@ func TestNewTextEngine(t *testing.T) {
 	require.NotNil(t, fltRes)
 	require.NotNil(t, fltRes.NetworkRule)
 
-	assert.Equal(t, fltRes.NetworkRule.FilterListID, testURLFilterID)
+	assert.Equal(t, fltRes.NetworkRule.GetFilterListID(), testURLFilterID)
 }

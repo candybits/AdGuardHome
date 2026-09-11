@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { fetchRequest } from './fetch';
 
 import { BASE_URL } from '../../constants';
 
@@ -13,20 +13,10 @@ class Api {
     async makeRequest(path: any, method = 'POST', config: any = {}) {
         const url = `${this.baseUrl}/${path}`;
 
-        const axiosConfig = config || {};
-        if (method !== 'GET' && axiosConfig.data) {
-            axiosConfig.headers = axiosConfig.headers || {};
-            axiosConfig.headers['Content-Type'] = axiosConfig.headers['Content-Type'] || 'application/json';
-        }
-
         try {
-            const response = await axios({
-                url,
-                method,
-                ...axiosConfig,
-            });
+            const response = await fetchRequest(url, method, config);
             return response.data;
-        } catch (error) {
+        } catch (error: any) {
             const errorPath = url;
 
             if (error.response) {
@@ -415,7 +405,7 @@ class Api {
     // Per-client settings
     GET_CLIENTS = { path: 'clients', method: 'GET' };
 
-    FIND_CLIENTS = { path: 'clients/find', method: 'GET' };
+    SEARCH_CLIENTS = { path: 'clients/search', method: 'POST' };
 
     ADD_CLIENT = { path: 'clients/add', method: 'POST' };
 
@@ -453,11 +443,12 @@ class Api {
         return this.makeRequest(path, method, parameters);
     }
 
-    findClients(params: any) {
-        const { path, method } = this.FIND_CLIENTS;
-        const url = getPathWithQueryString(path, params);
-
-        return this.makeRequest(url, method);
+    searchClients(config: any) {
+        const { path, method } = this.SEARCH_CLIENTS;
+        const parameters = {
+            data: config,
+        };
+        return this.makeRequest(path, method, parameters);
     }
 
     // DNS access settings
@@ -488,6 +479,10 @@ class Api {
 
     REWRITE_DELETE = { path: 'rewrite/delete', method: 'POST' };
 
+    REWRITE_SETTINGS = { path: 'rewrite/settings', method: 'GET' };
+
+    REWRITE_SETTINGS_UPDATE = { path: 'rewrite/settings/update', method: 'PUT' };
+
     getRewritesList() {
         const { path, method } = this.REWRITES_LIST;
 
@@ -510,12 +505,26 @@ class Api {
         return this.makeRequest(path, method, parameters);
     }
 
+    updateRewriteSettings(config: any) {
+        const { path, method } = this.REWRITE_SETTINGS_UPDATE;
+        const parameters = {
+            data: config,
+        };
+        return this.makeRequest(path, method, parameters);
+    }
+
     deleteRewrite(config: any) {
         const { path, method } = this.REWRITE_DELETE;
         const parameters = {
             data: config,
         };
         return this.makeRequest(path, method, parameters);
+    }
+
+    getRewriteSettings() {
+        const { path, method } = this.REWRITE_SETTINGS;
+
+        return this.makeRequest(path, method);
     }
 
     // Blocked services
